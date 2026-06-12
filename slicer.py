@@ -84,6 +84,7 @@ class Slicer:
         self.z_sample_height = 0.03
         self.z_detection_distance = self.layer_height
         self.horizontal_detection_distance = 0.3 * self.nozzle_diameter
+        self.min_line_segments = 4
 
 
     def slice(self) -> List[List[Point]]:
@@ -166,14 +167,30 @@ class Slicer:
                 if point != None:
                     if prev_point == None:
                         polygon_start_points.append(point)
-                elif prev_point != None and prev_point.prev == None:
-                    polygon_start_points.remove(prev_point)
-                    box_coord = self._to_box_coord(prev_point.to_pos())
-                    self.boxes[box_coord].remove(prev_point)
 
                 prev_point = point
             prev_coord = coord
+        for line_start in polygon_start_points[:]:
+            if not self._check_min_line_length(line_start):
+                polygon_start_points.remove(line_start)
+                self._remove_line(line_start)
         return polygon_start_points 
+
+    def _remove_line(self, line_start: Point | None):
+        while line_start != None:
+            box_coord = self._to_box_coord(line_start.to_pos())
+            self.boxes[box_coord].remove(line_start)
+            line_start = line_start.next
+
+    
+    def _check_min_line_length(self, line_start: Point | None) -> bool:
+        """checks whether the line has more segments than minimum line segments. 
+        Returns True if it has enogh."""
+        for i in range(self.min_line_segments):
+            if (line_start == None):
+                return False
+            line_start = line_start.next
+        return True
 
     def _check_pos(self, pos: tuple[float, float, float], prev: Point | None) -> Point | None:
         box_coord = self._to_box_coord(pos)
