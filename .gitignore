@@ -1,0 +1,10 @@
+# 3D Printing / Slicer files
+*.gcode
+*.gx
+
+# Python virtual environments / Environments folder
+myenvs/
+
+# Python caching
+__pycache__/
+*.pyc
