@@ -83,8 +83,8 @@ class Slicer:
         self.point_spacing = 0.1
         self.z_sample_height = 0.03
         self.z_detection_distance = self.layer_height
-        self.horizontal_detection_distance = 0.3 * self.nozzle_diameter
-        self.min_line_segments = 4
+        self.horizontal_detection_distance = 0.5 * self.nozzle_diameter
+        self.min_line_segments = 5
 
 
     def slice(self) -> List[List[Point]]:
