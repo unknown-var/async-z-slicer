@@ -16,7 +16,7 @@
   "prime_line_y_end": -55,
   "prime_line_extrusion": 15,
   "prime_line_speed": 1200,
-  "extrusion_factor": 0.06,
+  "extrusion_factor": 0.2,
 "start_gcode": [
     ";gcode_flavor: flashforge",
     ";machine_type: Finder",

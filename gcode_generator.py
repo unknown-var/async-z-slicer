@@ -104,7 +104,7 @@ class GCodeGenerator:
             dx = p2[0] - p1[0]
             dy = p2[1] - p1[1]
             distance = math.hypot(dx, dy)
-            return distance * self.extrusion_factor
+            return distance * self.extrusion_factor * self.layer_height
 
     def _add_end_gcode(self):
         """Add printer-specific end GCode"""

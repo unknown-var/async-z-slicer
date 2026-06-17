@@ -12,6 +12,7 @@ I will write this when i have time.
 - **Layer Slicing**: Slices models into horizontal layers using plane intersections
 - **Shapely Integration**: Converts cross-sections to shapely Polygons for advanced geometry operations
 - **Printer Profiles**: JSON-based printer configuration system
+- **Slicer Profiles**: JSON-based profile overrides for slicing parameters
 - **GCode Generation**: Generates printer-specific GCode with custom start/end sequences
 - **Easy Extensibility**: Clean class-based architecture for customization
 
@@ -34,8 +35,10 @@ python-slicer/
 ├── slicer.py              # Main slicer implementation
 ├── requirements.txt       # Python dependencies
 ├── README.md              # This file
-└── printer_settings/      # Printer configuration files
+├── printer_settings/      # Printer configuration files
     └── flashforge_finder.json
+└── slicer_profiles/       # Slicer profile overrides
+    └── fast.json
 ```
 
 ## Usage
@@ -52,6 +55,16 @@ This will:
 3. Slice the model into lines
 4. Generate GCode
 5. Save to `model.gcode`
+
+### With slicer profiles
+
+You can provide a slicer profile by name, with or without `.json`:
+
+```bash
+python slicer.py model.stl fast
+python slicer.py model.stl fast.json
+python slicer.py model.stl flashforge_finder fast output.gcode
+```
 
 ## Printer Settings Format
 
