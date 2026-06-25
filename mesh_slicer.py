@@ -95,10 +95,11 @@ class Slicer:
         self.min_line_segments = printer_settings.get('min_line_segments', printer_settings.get('MIN_LINE_SEGMENTS', MIN_LINE_SEGMENTS))
         self.long_line_sample_bias = printer_settings.get('long_line_sample_bias', printer_settings.get('LONG_LINE_SAMPLE_BIAS', LONG_LINE_SAMPLE_BIAS))
         self.vertical_offset_multiple = printer_settings.get('vertical_offset_multiple', printer_settings.get('VERTICAL_OFFSET_MULTIPLE', VERTICAL_OFFSET_MULTIPLE))
+        self.solid_bottom_layer = printer_settings.get('solid_bottom_layer', printer_settings.get('SOLID_BOTTOM_LAYER', True))
         self.num_walls = printer_settings.get('number_of_walls', 1)
         self.debug = True # Set to True to export inset meshes as STL
         
-        print(f"✓ Slicing settings: point_spacing={self.point_spacing}, z_samples_per_layer={self.z_samples_per_layer}, horizontal_detection_distance_multiple={self.horizontal_detection_distance_multiple}, min_line_segments={self.min_line_segments}, long_line_sample_bias={self.long_line_sample_bias}, vertical_offset_multiple={self.vertical_offset_multiple}")
+        print(f"✓ Slicing settings: point_spacing={self.point_spacing}, z_samples_per_layer={self.z_samples_per_layer}, horizontal_detection_distance_multiple={self.horizontal_detection_distance_multiple}, min_line_segments={self.min_line_segments}, long_line_sample_bias={self.long_line_sample_bias}, vertical_offset_multiple={self.vertical_offset_multiple}, solid_bottom_layer={self.solid_bottom_layer}")
 
         self.layers: List[List[Point]] = []
 
@@ -180,18 +181,94 @@ class Slicer:
         """
         local_boxes: dict[tuple[int, int, int], list[Point]] = {}
         layer_dict: dict[float, list[Point]] = defaultdict(list)
+        first_layer_done = False
 
         for z in z_values:
             polygons = self._polygons_at_z(mesh, z)
+            valid_polygons = [p for p in polygons if p and not p.is_empty]
+            if not valid_polygons:
+                continue
+
             layer_line_starts: list[Point] = []
             
-            for polygon in polygons:
-                layer_line_starts.extend(self._slice_polygon(z, polygon, local_boxes))
+            if not first_layer_done:
+                for polygon in valid_polygons:
+                    if self.solid_bottom_layer:
+                        layer_line_starts.extend(self._slice_polygon_solid(z, polygon, local_boxes))
+                    else:
+                        layer_line_starts.extend(self._slice_polygon(z, polygon, local_boxes))
+                if layer_line_starts:
+                    if self.solid_bottom_layer:
+                        print(f"✓ Sliced first wall layer at Z={z:.3f}mm as solid fill (paths={len(layer_line_starts)})")
+                    first_layer_done = True
+            else:
+                for polygon in valid_polygons:
+                    layer_line_starts.extend(self._slice_polygon(z, polygon, local_boxes))
             
             if layer_line_starts:
                 layer_dict[z].extend(layer_line_starts)
 
         return layer_dict
+
+    def _slice_polygon_solid(self, z: float, polygon: Polygon, local_boxes: dict) -> List[Point]:
+        if isinstance(polygon, MultiPolygon):
+            starts = []
+            for sub_poly in polygon.geoms:
+                starts.extend(self._slice_polygon_solid(z, sub_poly, local_boxes))
+            return starts
+        if isinstance(polygon, GeometryCollection):
+            starts = []
+            for geom in polygon.geoms:
+                starts.extend(self._slice_polygon_solid(z, geom, local_boxes))
+            return starts
+        if not isinstance(polygon, Polygon) or polygon.is_empty:
+            return []
+
+        starts = []
+        # Slice the boundary of the current polygon
+        starts.extend(self._slice_single_ring_solid(z, polygon, local_boxes))
+        
+        # Buffer inward by nozzle diameter and recursively slice
+        inset = polygon.buffer(-self.nozzle_diameter)
+        if inset and not inset.is_empty:
+            starts.extend(self._slice_polygon_solid(z, inset, local_boxes))
+            
+        return starts
+
+    def _slice_single_ring_solid(self, z: float, polygon: Polygon, local_boxes: dict) -> List[Point]:
+        coords = list(polygon.exterior.coords)
+        if len(coords) < 2:
+            return []
+
+        polygon_start_points = []
+        prev_coord = (coords[0][0], coords[0][1], z)
+        prev_point = self._add_pos_without_collision(prev_coord, None, local_boxes)
+        polygon_start_points.append(prev_point)
+
+        for coord2d in coords[1:]:
+            coord = (coord2d[0], coord2d[1], z)
+            for pos in self._points_to_point(prev_coord, coord):
+                point = self._add_pos_without_collision(pos, prev_point, local_boxes)
+                prev_point = point
+            prev_coord = coord
+
+        for line_start in polygon_start_points[:]:
+            if not self._check_min_line_length(line_start):
+                polygon_start_points.remove(line_start)
+                self._remove_line(line_start, local_boxes)
+
+        return polygon_start_points
+
+    def _add_pos_without_collision(self, pos: tuple[float, float, float], prev: Point | None, local_boxes: dict) -> Point:
+        box_coord = self._to_box_coord(pos)
+        point = Point(pos[0], pos[1], pos[2], prev)
+        if prev is not None:
+            prev.next = point
+
+        if box_coord not in local_boxes:
+            local_boxes[box_coord] = []
+        local_boxes[box_coord].append(point)
+        return point
 
     def _slice_polygon(self, z: float, polygon: Polygon, local_boxes: dict) -> List[Point]:
         if isinstance(polygon, MultiPolygon):
