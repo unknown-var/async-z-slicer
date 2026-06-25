@@ -81,16 +81,25 @@ class Slicer:
         
         self.box_height = self.layer_height
         self.box_width = self.nozzle_diameter
-        self.point_spacing = POINT_SPACING
-        self.z_sample_height = self.layer_height / Z_SAMPLES_PER_LAYER
+        self.point_spacing = printer_settings.get('point_spacing', printer_settings.get('POINT_SPACING', POINT_SPACING))
+        self.z_samples_per_layer = printer_settings.get('z_samples_per_layer', printer_settings.get('Z_SAMPLES_PER_LAYER', Z_SAMPLES_PER_LAYER))
+        self.z_sample_height = self.layer_height / self.z_samples_per_layer
         self.z_detection_distance = self.layer_height
         
+        self.horizontal_detection_distance_multiple = printer_settings.get(
+            'horizontal_detection_distance_multiple',
+            printer_settings.get('HORIZONTAL_DETECTION_DISTANCE_MULTIPLE', HORIZONTAL_DETECTION_DISTANCE_MULTIPLE)
+        )
         d = math.sqrt(4 * self.nozzle_diameter * self.layer_height / math.pi)
-        self.horizontal_detection_distance = HORIZONTAL_DETECTION_DISTANCE_MULTIPLE * d
-        self.min_line_segments = MIN_LINE_SEGMENTS
+        self.horizontal_detection_distance = self.horizontal_detection_distance_multiple * d
+        self.min_line_segments = printer_settings.get('min_line_segments', printer_settings.get('MIN_LINE_SEGMENTS', MIN_LINE_SEGMENTS))
+        self.long_line_sample_bias = printer_settings.get('long_line_sample_bias', printer_settings.get('LONG_LINE_SAMPLE_BIAS', LONG_LINE_SAMPLE_BIAS))
+        self.vertical_offset_multiple = printer_settings.get('vertical_offset_multiple', printer_settings.get('VERTICAL_OFFSET_MULTIPLE', VERTICAL_OFFSET_MULTIPLE))
         self.num_walls = printer_settings.get('number_of_walls', 1)
         self.debug = True # Set to True to export inset meshes as STL
         
+        print(f"✓ Slicing settings: point_spacing={self.point_spacing}, z_samples_per_layer={self.z_samples_per_layer}, horizontal_detection_distance_multiple={self.horizontal_detection_distance_multiple}, min_line_segments={self.min_line_segments}, long_line_sample_bias={self.long_line_sample_bias}, vertical_offset_multiple={self.vertical_offset_multiple}")
+
         self.layers: List[List[Point]] = []
 
     def slice(self) -> List[List[Point]]:
@@ -122,7 +131,7 @@ class Slicer:
             h_offset = (wall_idx + 0.5) * self.nozzle_diameter
             
             # For standard walls, we don't want a vertical offset here as it causes Z-phase issues
-            v_offset = (wall_idx + 0.5) * self.horizontal_detection_distance * VERTICAL_OFFSET_MULTIPLE
+            v_offset = (wall_idx + 0.5) * self.horizontal_detection_distance * self.vertical_offset_multiple
             
             print(f"Generating inset mesh (offset={h_offset:.2f}mm)...")
             current_mesh = generate_inset_mesh(
@@ -216,7 +225,7 @@ class Slicer:
                 past_coords.append(pos)
                 multiple = 1
                 if prev_point != None:
-                    multiple = LONG_LINE_SAMPLE_BIAS
+                    multiple = self.long_line_sample_bias
 
                 point = self._check_pos(pos, prev_point, local_boxes, multiple=multiple)
                 if point is not None:
@@ -244,7 +253,7 @@ class Slicer:
                 point.next = end_point
                 return None
 
-            point = self._check_pos(pos, None, local_boxes, multiple=LONG_LINE_SAMPLE_BIAS)
+            point = self._check_pos(pos, None, local_boxes, multiple=self.long_line_sample_bias)
             if point == None:
                 return end_point
             end_point.prev = point
