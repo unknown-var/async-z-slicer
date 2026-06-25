@@ -1,3 +1,5 @@
 trimesh
 shapely
 numpy
+mesh_to_sdf
+scikit-image

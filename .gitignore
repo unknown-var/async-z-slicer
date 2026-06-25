@@ -1,6 +1,7 @@
 # 3D Printing / Slicer files
 *.gcode
 *.gx
+*.stl
 
 # Python virtual environments / Environments folder
 myenvs/

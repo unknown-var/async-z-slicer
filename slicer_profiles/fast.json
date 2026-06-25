@@ -1,4 +1,5 @@
 {
   "layer_height": 0.3,
-  "nozzle_temp": 210
+  "nozzle_temp": 210,
+  "number_of_walls": 2
 }    
