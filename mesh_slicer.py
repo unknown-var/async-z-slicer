@@ -12,6 +12,20 @@ from collections import defaultdict
 # Import the SDF generator
 from sdf_generator import generate_inset_mesh
 
+# This is the bias which decides how much shorter the distance to a point has to be if the last point was in a line
+LONG_LINE_SAMPLE_BIAS = 0.9
+
+# This multiple influences how tight lines are packed in leaning geomitry. Lower is more lines
+HORIZONTAL_DETECTION_DISTANCE_MULTIPLE = 0.7
+
+# This decides the vertical distance between to wall layers
+VERTICAL_OFFSET_MULTIPLE = 1.15
+
+MIN_LINE_SEGMENTS = 20
+
+Z_SAMPLES_PER_LAYER = 10
+
+POINT_SPACING = 0.1
 
 class PrinterSettings:
     """Loads and manages printer configuration from JSON"""
@@ -67,13 +81,13 @@ class Slicer:
         
         self.box_height = self.layer_height
         self.box_width = self.nozzle_diameter
-        self.point_spacing = 0.1
-        self.z_sample_height = self.layer_height / 10
+        self.point_spacing = POINT_SPACING
+        self.z_sample_height = self.layer_height / Z_SAMPLES_PER_LAYER
         self.z_detection_distance = self.layer_height
         
         d = math.sqrt(4 * self.nozzle_diameter * self.layer_height / math.pi)
-        self.horizontal_detection_distance = 0.7 * d
-        self.min_line_segments = 20
+        self.horizontal_detection_distance = HORIZONTAL_DETECTION_DISTANCE_MULTIPLE * d
+        self.min_line_segments = MIN_LINE_SEGMENTS
         self.num_walls = printer_settings.get('number_of_walls', 1)
         self.debug = True # Set to True to export inset meshes as STL
         
@@ -108,7 +122,7 @@ class Slicer:
             h_offset = (wall_idx + 0.5) * self.nozzle_diameter
             
             # For standard walls, we don't want a vertical offset here as it causes Z-phase issues
-            v_offset = (wall_idx + 0.5) * self.horizontal_detection_distance * 1.1
+            v_offset = (wall_idx + 0.5) * self.horizontal_detection_distance * VERTICAL_OFFSET_MULTIPLE
             
             print(f"Generating inset mesh (offset={h_offset:.2f}mm)...")
             current_mesh = generate_inset_mesh(
@@ -192,17 +206,24 @@ class Slicer:
         prev_coord = (coords[0][0], coords[0][1], z)
         prev_point: Point | None = None
 
-        prev_point = self._check_pos(prev_coord, prev_point, local_boxes)
+        prev_point = self._check_pos(prev_coord, prev_point, local_boxes, 1)
         if prev_point is not None:
             polygon_start_points.append(prev_point)
-
+        past_coords = []
         for coord2d in coords:
             coord = (coord2d[0], coord2d[1], z)
             for pos in self._points_to_point(prev_coord, coord):
-                point = self._check_pos(pos, prev_point, local_boxes)
+                past_coords.append(pos)
+                multiple = 1
+                if prev_point != None:
+                    multiple = LONG_LINE_SAMPLE_BIAS
+
+                point = self._check_pos(pos, prev_point, local_boxes, multiple=multiple)
                 if point is not None:
                     if prev_point is None:
-                        polygon_start_points.append(point)
+                        start_point = self._grow_line_backwards(past_coords, point, local_boxes=local_boxes)
+                        if start_point != None:
+                            polygon_start_points.append(start_point)
                 prev_point = point
             prev_coord = coord
             
@@ -212,6 +233,37 @@ class Slicer:
                 self._remove_line(line_start, local_boxes)
                 
         return polygon_start_points 
+
+    def _grow_line_backwards(self, positions: list[tuple[float, float, float]], end_point: Point, local_boxes: dict) -> Point | None:
+        #skiping last element because it is the current element from which to grow backwards
+        for pos in reversed(positions[:-1]):
+            # This scenario seems impossible the more I think about it, but it can't hurt, right?
+            point = self._check_if_pos_is_point(pos, local_boxes=local_boxes)
+            if point != None:
+                print("the impossible is possible why did it happen??")
+                point.next = end_point
+                return None
+
+            point = self._check_pos(pos, None, local_boxes, multiple=LONG_LINE_SAMPLE_BIAS)
+            if point == None:
+                return end_point
+            end_point.prev = point
+            point.next = end_point
+            end_point = point
+        return end_point
+
+
+
+    def _check_if_pos_is_point(self, pos: tuple[float, float, float], local_boxes: dict) -> Point | None:
+        box_coord = self._to_box_coord(pos)
+        if box_coord in local_boxes:
+            for point in local_boxes[box_coord]:
+                if point.x == pos[0] and point.y == pos[1] and point.z == pos[2]:
+                    return point
+        return None
+
+
+
 
     def _remove_line(self, line_start: Point | None, local_boxes: dict):
         while line_start is not None:
@@ -227,15 +279,14 @@ class Slicer:
             line_start = line_start.next
         return True
 
-    def _check_pos(self, pos: tuple[float, float, float], prev: Point | None, local_boxes: dict) -> Point | None:
+    def _check_pos(self, pos: tuple[float, float, float], prev: Point | None, local_boxes: dict, multiple: float) -> Point | None:
         box_coord = self._to_box_coord(pos)
         x_range = range(-1, 2)
         y_range = range(-1, 2)
         z_range = range(-1, 1)
-
         for x, y, z in itertools.product(x_range, y_range, z_range):
             coord = (box_coord[0]+x, box_coord[1]+y, box_coord[2]+z)
-            if self._check_box_against_pos(coord, pos, local_boxes):
+            if self._check_box_against_pos(coord, pos, local_boxes, mutliple=multiple):
                 return None
                 
         point = Point(pos[0], pos[1], pos[2], prev)
@@ -247,7 +298,7 @@ class Slicer:
         local_boxes[box_coord].append(point)
         return point
 
-    def _check_box_against_pos(self, box_coord: tuple[int, int, int], pos: tuple[float, float, float], local_boxes: dict) -> bool:
+    def _check_box_against_pos(self, box_coord: tuple[int, int, int], pos: tuple[float, float, float], local_boxes: dict, mutliple: float) -> bool:
         if box_coord not in local_boxes:
             return False
             
@@ -263,7 +314,7 @@ class Slicer:
             z_component = ((point.z - pos[2]) ** 2) / denom_height
 
             result = x_component + y_component + z_component
-            if result < 0.99:
+            if result < 0.99 * mutliple:
                 return True
         return False
 
