@@ -113,6 +113,36 @@ Printer settings are JSON files with the following structure:
 - `nozzle_diameter`: Nozzle diameter in mm
 - `default_layer_height`: Default layer height in mm
 
+## Slicer Profile Format
+
+Slicer profiles are JSON files located in the `slicer_profiles/` directory. They can override printer settings and configure specific slicing options.
+
+Example profile:
+
+```json
+{
+  "layer_height": 0.3,
+  "number_of_walls": 2,
+  "solid_bottom_layer": true,
+  "infill": true,
+  "infill_spacing": 2.5
+}
+```
+
+### Configurable Slicing Settings
+
+You can override printer properties (e.g. `layer_height`, `number_of_walls`) as well as the following slicing parameters in your profile:
+
+- `solid_bottom_layer` (bool): If true, slices the first actual layer of every wall layer as a solid filled layer. Default is `true`.
+- `infill` (bool): If true, generates linear infill inside the innermost wall boundary. Default is `true`.
+- `infill_spacing` (float): Spacing between parallel infill lines in mm. Default is `2.5` mm.
+- `point_spacing` (float): Distance between generated points along a path in mm. Default is `0.1` mm.
+- `z_samples_per_layer` (int): Number of Z-level samples per layer height (asynchronous wall resolution). Default is `10`.
+- `horizontal_detection_distance_multiple` (float): Influences how tightly path lines are packed in leaning geometry. Default is `0.7`.
+- `vertical_offset_multiple` (float): Slicing Z-offset scaling multiplier for inner walls. Default is `1.15`.
+- `min_line_segments` (int): Minimum number of segments in a path before it gets discarded to prevent blobs. Default is `20`.
+- `long_line_sample_bias` (float): Distance sample bias for straight lines. Default is `0.9`.
+
 ### GCode Template Variables
 
 In `start_gcode` and `end_gcode`, use these variables:

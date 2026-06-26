@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from typing import List, Dict, Any, Optional
 import trimesh
-from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, LineString, MultiLineString
+from shapely.affinity import rotate
 import numpy as np
 import math
 import itertools
@@ -96,10 +97,12 @@ class Slicer:
         self.long_line_sample_bias = printer_settings.get('long_line_sample_bias', printer_settings.get('LONG_LINE_SAMPLE_BIAS', LONG_LINE_SAMPLE_BIAS))
         self.vertical_offset_multiple = printer_settings.get('vertical_offset_multiple', printer_settings.get('VERTICAL_OFFSET_MULTIPLE', VERTICAL_OFFSET_MULTIPLE))
         self.solid_bottom_layer = printer_settings.get('solid_bottom_layer', printer_settings.get('SOLID_BOTTOM_LAYER', True))
+        self.infill = printer_settings.get('infill', printer_settings.get('INFILL', True))
+        self.infill_spacing = printer_settings.get('infill_spacing', printer_settings.get('INFILL_SPACING', 2.5))
         self.num_walls = printer_settings.get('number_of_walls', 1)
         self.debug = True # Set to True to export inset meshes as STL
         
-        print(f"✓ Slicing settings: point_spacing={self.point_spacing}, z_samples_per_layer={self.z_samples_per_layer}, horizontal_detection_distance_multiple={self.horizontal_detection_distance_multiple}, min_line_segments={self.min_line_segments}, long_line_sample_bias={self.long_line_sample_bias}, vertical_offset_multiple={self.vertical_offset_multiple}, solid_bottom_layer={self.solid_bottom_layer}")
+        print(f"✓ Slicing settings: point_spacing={self.point_spacing}, z_samples_per_layer={self.z_samples_per_layer}, horizontal_detection_distance_multiple={self.horizontal_detection_distance_multiple}, min_line_segments={self.min_line_segments}, long_line_sample_bias={self.long_line_sample_bias}, vertical_offset_multiple={self.vertical_offset_multiple}, solid_bottom_layer={self.solid_bottom_layer}, infill={self.infill}, infill_spacing={self.infill_spacing}")
 
         self.layers: List[List[Point]] = []
 
@@ -158,6 +161,34 @@ class Slicer:
             for z, start_points in wall_starts.items():
                 combined_layers[z].extend(start_points)
 
+        if self.infill:
+            print("--- Infill ---")
+            infill_h_offset = self.num_walls * self.nozzle_diameter
+            infill_v_offset = self.num_walls * self.horizontal_detection_distance * self.vertical_offset_multiple
+            
+            print(f"Generating infill mesh (offset={infill_h_offset:.2f}mm)...")
+            infill_mesh = generate_inset_mesh(
+                self.main_mesh,
+                horizontal_offset=infill_h_offset,
+                vertical_offset=infill_v_offset,
+                pitch=0.1
+            )
+            
+            if infill_mesh is not None:
+                if self.debug:
+                    debug_name = "debug_infill.stl"
+                    infill_mesh.export(debug_name)
+                    print(f"Debug infill mesh saved to {debug_name}")
+                
+                print("Slicing infill paths from mesh...")
+                infill_z_values = np.arange(z_start, z_stop, self.layer_height)
+                infill_starts = self._process_infill_mesh(infill_mesh, infill_z_values)
+                
+                for z, start_points in infill_starts.items():
+                    combined_layers[z].extend(start_points)
+            else:
+                print("Infill geometry collapsed. No infill generated.")
+
         print("Finalizing layers...")
 
         # Order by Z-height and save to self.layers
@@ -209,6 +240,112 @@ class Slicer:
                 layer_dict[z].extend(layer_line_starts)
 
         return layer_dict
+
+    def _process_infill_mesh(
+        self, 
+        mesh: trimesh.Trimesh, 
+        z_values: np.ndarray
+    ) -> dict[float, list[Point]]:
+        """
+        Slices the infill mesh at standard layer heights and generates parallel infill lines.
+        """
+        local_boxes: dict[tuple[int, int, int], list[Point]] = {}
+        layer_dict: dict[float, list[Point]] = defaultdict(list)
+
+        for layer_idx, z in enumerate(z_values):
+            polygons = self._polygons_at_z(mesh, z)
+            valid_polygons = [p for p in polygons if p and not p.is_empty]
+            if not valid_polygons:
+                continue
+
+            # Alternate angle between 45 and 135 degrees
+            angle = 45 if layer_idx % 2 == 0 else 135
+            layer_line_starts: list[Point] = []
+
+            for polygon in valid_polygons:
+                # Generate infill lines inside this polygon
+                infill_starts = self._slice_polygon_infill(z, polygon, angle, local_boxes)
+                layer_line_starts.extend(infill_starts)
+
+            if layer_line_starts:
+                print(f"✓ Sliced infill layer at Z={z:.3f}mm (paths={len(layer_line_starts)})")
+                layer_dict[z].extend(layer_line_starts)
+
+        return layer_dict
+
+    def _slice_polygon_infill(self, z: float, polygon: Polygon, angle: float, local_boxes: dict) -> List[Point]:
+        if isinstance(polygon, MultiPolygon):
+            starts = []
+            for sub_poly in polygon.geoms:
+                starts.extend(self._slice_polygon_infill(z, sub_poly, angle, local_boxes))
+            return starts
+        if isinstance(polygon, GeometryCollection):
+            starts = []
+            for geom in polygon.geoms:
+                starts.extend(self._slice_polygon_infill(z, geom, angle, local_boxes))
+            return starts
+        if not isinstance(polygon, Polygon) or polygon.is_empty:
+            return []
+
+        # Find bounds and diagonal radius
+        minx, miny, maxx, maxy = polygon.bounds
+        cx = (minx + maxx) / 2
+        cy = (miny + maxy) / 2
+        r = math.hypot(maxx - minx, maxy - miny) / 2
+
+        # Generate a set of parallel lines at the center and rotate them
+        lines = []
+        y = cy - r
+        while y <= cy + r:
+            line = LineString([(cx - r, y), (cx + r, y)])
+            rotated_line = rotate(line, angle, origin=(cx, cy))
+            lines.append(rotated_line)
+            y += self.infill_spacing
+
+        if not lines:
+            return []
+
+        # Intersect lines with the polygon
+        infill_geom = polygon.intersection(MultiLineString(lines))
+        linestrings = self._extract_linestrings(infill_geom)
+
+        infill_starts = []
+        for line in linestrings:
+            coords = list(line.coords)
+            if len(coords) < 2:
+                continue
+
+            # Start of the infill line
+            prev_coord = (coords[0][0], coords[0][1], z)
+            prev_point = self._add_pos_without_collision(prev_coord, None, local_boxes)
+            infill_starts.append(prev_point)
+
+            for coord2d in coords[1:]:
+                coord = (coord2d[0], coord2d[1], z)
+                for pos in self._points_to_point(prev_coord, coord):
+                    point = self._add_pos_without_collision(pos, prev_point, local_boxes)
+                    prev_point = point
+                prev_coord = coord
+
+        # Filter out short lines
+        for line_start in infill_starts[:]:
+            if not self._check_min_line_length(line_start):
+                infill_starts.remove(line_start)
+                self._remove_line(line_start, local_boxes)
+
+        return infill_starts
+
+    def _extract_linestrings(self, geom) -> List[LineString]:
+        if geom.is_empty:
+            return []
+        if isinstance(geom, LineString):
+            return [geom]
+        if hasattr(geom, 'geoms'):
+            res = []
+            for g in geom.geoms:
+                res.extend(self._extract_linestrings(g))
+            return res
+        return []
 
     def _slice_polygon_solid(self, z: float, polygon: Polygon, local_boxes: dict) -> List[Point]:
         if isinstance(polygon, MultiPolygon):
