@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Dict, Any, Optional
 import trimesh
-from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, LineString, MultiLineString
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, LineString, MultiLineString, Point as PolygonPoint
 from shapely.affinity import rotate
 import numpy as np
 import math
@@ -95,6 +95,8 @@ class Slicer:
         self.horizontal_detection_distance = self.horizontal_detection_distance_multiple * d
         self.min_line_segments = printer_settings.get('min_line_segments', printer_settings.get('MIN_LINE_SEGMENTS', MIN_LINE_SEGMENTS))
         self.long_line_sample_bias = printer_settings.get('long_line_sample_bias', printer_settings.get('LONG_LINE_SAMPLE_BIAS', LONG_LINE_SAMPLE_BIAS))
+        self.flat_surface_bias = printer_settings.get('flat_surface_bias', 0.2 * self.nozzle_diameter)
+        print(f"long_line_sample bias: {self.long_line_sample_bias}")
         self.vertical_offset_multiple = printer_settings.get('vertical_offset_multiple', printer_settings.get('VERTICAL_OFFSET_MULTIPLE', VERTICAL_OFFSET_MULTIPLE))
         self.solid_bottom_layer = printer_settings.get('solid_bottom_layer', printer_settings.get('SOLID_BOTTOM_LAYER', True))
         self.infill = printer_settings.get('infill', printer_settings.get('INFILL', True))
@@ -228,6 +230,7 @@ class Slicer:
                         layer_line_starts.extend(self._slice_polygon_solid(z, polygon, local_boxes))
                     else:
                         layer_line_starts.extend(self._slice_polygon(z, polygon, local_boxes))
+                        layer_line_starts.extend(self._generate_flat_surfaces_for_polygon(z, polygon, mesh, local_boxes))
                 if layer_line_starts:
                     if self.solid_bottom_layer:
                         print(f"✓ Sliced first wall layer at Z={z:.3f}mm as solid fill (paths={len(layer_line_starts)})")
@@ -235,11 +238,50 @@ class Slicer:
             else:
                 for polygon in valid_polygons:
                     layer_line_starts.extend(self._slice_polygon(z, polygon, local_boxes))
+                    layer_line_starts.extend(self._generate_flat_surfaces_for_polygon(z, polygon, mesh, local_boxes))
             
             if layer_line_starts:
                 layer_dict[z].extend(layer_line_starts)
 
         return layer_dict
+
+    def _generate_flat_surfaces_for_polygon(
+        self, 
+        z: float, 
+        polygon: Polygon, 
+        mesh: trimesh.Trimesh, 
+        local_boxes: dict
+    ) -> List[Point]:
+        from shapely.ops import unary_union
+        from shapely.prepared import prep
+
+        # 1. Retrieve polygons of the above layer (at z + z_sample_height)
+        polygons_above = self._polygons_at_z(mesh, z + self.z_sample_height)
+        above_geom = unary_union(polygons_above)
+        above_geom_prep = prep(above_geom) if not above_geom.is_empty else None
+
+        # 2. Prepare lenient geometry using the flat_surface_bias
+        bias_distance = self.flat_surface_bias
+        above_geom_lenient = above_geom.buffer(-bias_distance) if (not above_geom.is_empty and bias_distance > 0) else above_geom
+        above_geom_lenient_prep = prep(above_geom_lenient) if not above_geom_lenient.is_empty else None
+
+        # 3. Concentric insetting loop
+        flat_starts = []
+        current_inset = polygon.buffer(-self.horizontal_detection_distance)
+        
+        while current_inset and not current_inset.is_empty:
+            inset_starts, had_outside_points = self._slice_flat_surface_inset(
+                z, current_inset, local_boxes, above_geom_prep, above_geom_lenient_prep
+            )
+            flat_starts.extend(inset_starts)
+            
+            if had_outside_points:
+                current_inset = current_inset.buffer(-self.nozzle_diameter)
+            else:
+                break
+                
+        return flat_starts
+
 
     def _process_infill_mesh(
         self, 
@@ -474,6 +516,137 @@ class Slicer:
             point.next = end_point
             end_point = point
         return end_point
+
+    def _grow_line_backwards_flat(
+        self, 
+        positions: list[tuple[float, float, float]], 
+        end_point: Point, 
+        local_boxes: dict,
+        above_geom_prep
+    ) -> Point | None:
+        for pos in reversed(positions[:-1]):
+            p = PolygonPoint(pos[0], pos[1])
+            if above_geom_prep is not None and above_geom_prep.contains(p):
+                return end_point
+
+            point = self._check_if_pos_is_point(pos, local_boxes=local_boxes)
+            if point is not None:
+                point.next = end_point
+                return None
+
+            point = self._check_pos(pos, None, local_boxes, multiple=self.long_line_sample_bias)
+            if point is None:
+                return end_point
+            end_point.prev = point
+            point.next = end_point
+            end_point = point
+        return end_point
+
+    def _slice_flat_surface_inset(
+        self, 
+        z: float, 
+        polygon: Polygon, 
+        local_boxes: dict, 
+        above_geom_prep, 
+        above_geom_lenient_prep
+    ) -> tuple[List[Point], bool]:
+        if isinstance(polygon, MultiPolygon):
+            starts = []
+            had_outside = False
+            for sub_poly in polygon.geoms:
+                sub_starts, sub_outside = self._slice_flat_surface_inset(
+                    z, sub_poly, local_boxes, above_geom_prep, above_geom_lenient_prep
+                )
+                starts.extend(sub_starts)
+                if sub_outside:
+                    had_outside = True
+            return starts, had_outside
+            
+        if isinstance(polygon, GeometryCollection):
+            starts = []
+            had_outside = False
+            for geom in polygon.geoms:
+                sub_starts, sub_outside = self._slice_flat_surface_inset(
+                    z, geom, local_boxes, above_geom_prep, above_geom_lenient_prep
+                )
+                starts.extend(sub_starts)
+                if sub_outside:
+                    had_outside = True
+            return starts, had_outside
+            
+        if not isinstance(polygon, Polygon) or polygon.is_empty:
+            return [], False
+
+        coords = list(polygon.exterior.coords)
+        if len(coords) < 2:
+            return [], False
+
+        polygon_start_points = []
+        prev_coord = (coords[0][0], coords[0][1], z)
+        prev_point: Point | None = None
+
+        p = PolygonPoint(prev_coord[0], prev_coord[1])
+        if above_geom_prep is not None and above_geom_prep.contains(p):
+            blocked = True
+        else:
+            blocked = False
+
+        if not blocked:
+            prev_point = self._check_pos(prev_coord, None, local_boxes, multiple=1.0)
+            if prev_point is not None:
+                polygon_start_points.append(prev_point)
+
+        past_coords = []
+        for coord2d in coords:
+            coord = (coord2d[0], coord2d[1], z)
+            for pos in self._points_to_point(prev_coord, coord):
+                past_coords.append(pos)
+                
+                # Check if this point is blocked by the above layer
+                p_pos = PolygonPoint(pos[0], pos[1])
+                if prev_point is not None and above_geom_lenient_prep is not None:
+                    blocked = above_geom_lenient_prep.contains(p_pos)
+                elif prev_point is None and above_geom_prep is not None:
+                    blocked = above_geom_prep.contains(p_pos)
+                else:
+                    blocked = False
+                
+                if blocked:
+                    prev_point = None
+                else:
+                    multiple = self.long_line_sample_bias if prev_point is not None else 1.0
+                    point = self._check_pos(pos, prev_point, local_boxes, multiple=multiple)
+                    if point is not None:
+                        if prev_point is None:
+                            start_point = self._grow_line_backwards_flat(
+                                past_coords, point, local_boxes, above_geom_prep
+                            )
+                            if start_point is not None:
+                                polygon_start_points.append(start_point)
+                        prev_point = point
+                    else:
+                        prev_point = None
+            prev_coord = coord
+            
+        for line_start in polygon_start_points[:]:
+            if not self._check_min_line_length(line_start):
+                polygon_start_points.remove(line_start)
+                self._remove_line(line_start, local_boxes)
+
+        had_outside_points = False
+        for line_start in polygon_start_points:
+            curr = line_start
+            while curr is not None:
+                p_curr = PolygonPoint(curr.x, curr.y)
+                if above_geom_prep is None or not above_geom_prep.contains(p_curr):
+                    had_outside_points = True
+                    break
+                curr = curr.next
+            if had_outside_points:
+                break
+                
+        return polygon_start_points, had_outside_points
+
 
 
 

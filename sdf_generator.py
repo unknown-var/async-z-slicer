@@ -92,6 +92,6 @@ def generate_inset_mesh(
         inset_mesh.apply_scale([1.0, 1.0, 1.0 / z_scale])
 
     # Laplacian smoothing to reduce surface noise from voxelization
-    #trimesh.smoothing.filter_laplacian(inset_mesh, iterations=3)
+    trimesh.smoothing.filter_laplacian(inset_mesh, iterations=3)
 
     return inset_mesh

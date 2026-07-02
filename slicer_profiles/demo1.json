@@ -1,0 +1,7 @@
+{
+  "layer_height": 0.3,
+  "number_of_walls": 1,
+  "solid_bottom_layer": false,
+  "infill": false,
+  "min_line_segments": 10
+}
