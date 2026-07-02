@@ -9,7 +9,7 @@ import numpy as np
 import math
 import itertools
 from collections import defaultdict
-
+import shapely
 # Import the SDF generator
 from sdf_generator import generate_inset_mesh
 from profiler import SlicerProfiler
@@ -106,6 +106,10 @@ class Slicer:
         self.debug = True # Set to True to export inset meshes as STL
         
         print(f"✓ Slicing settings: point_spacing={self.point_spacing}, z_samples_per_layer={self.z_samples_per_layer}, horizontal_detection_distance_multiple={self.horizontal_detection_distance_multiple}, min_line_segments={self.min_line_segments}, long_line_sample_bias={self.long_line_sample_bias}, vertical_offset_multiple={self.vertical_offset_multiple}, solid_bottom_layer={self.solid_bottom_layer}, infill={self.infill}, infill_spacing={self.infill_spacing}")
+
+        self.inv_denom_width = 1.0 / (self.horizontal_detection_distance ** 2) if self.horizontal_detection_distance != 0 else 0.0
+        self.inv_denom_height = 1.0 / (self.z_detection_distance ** 2) if self.z_detection_distance != 0 else 0.0
+        self._box_offsets = list(itertools.product(range(-1, 2), range(-1, 2), range(-1, 1)))
 
         self.layers: List[List[Point]] = []
 
@@ -298,29 +302,30 @@ class Slicer:
         local_boxes: dict
     ) -> List[Point]:
         from shapely.ops import unary_union
-        from shapely.prepared import prep
 
         above_z = round(z + self.z_sample_height, 6)
         cache_key = (id(mesh), above_z)
         
         if hasattr(self, '_above_geom_cache') and cache_key in self._above_geom_cache:
-            above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds = self._above_geom_cache[cache_key]
+            above_geom, above_geom_lenient, above_bounds, lenient_bounds = self._above_geom_cache[cache_key]
         else:
             # 1. Retrieve polygons of the above layer (at z + z_sample_height)
             polygons_above = self._polygons_at_z(mesh, above_z)
             above_geom = unary_union(polygons_above)
-            above_geom_prep = prep(above_geom) if not above_geom.is_empty else None
+            if not above_geom.is_empty:
+                shapely.prepare(above_geom)
 
             # 2. Prepare lenient geometry using the flat_surface_bias
             bias_distance = self.flat_surface_bias
             above_geom_lenient = above_geom.buffer(-bias_distance) if (not above_geom.is_empty and bias_distance > 0) else above_geom
-            above_geom_lenient_prep = prep(above_geom_lenient) if not above_geom_lenient.is_empty else None
+            if not above_geom_lenient.is_empty:
+                shapely.prepare(above_geom_lenient)
             
             above_bounds = above_geom.bounds if not above_geom.is_empty else None
             lenient_bounds = above_geom_lenient.bounds if not above_geom_lenient.is_empty else None
             
             if hasattr(self, '_above_geom_cache'):
-                self._above_geom_cache[cache_key] = (above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds)
+                self._above_geom_cache[cache_key] = (above_geom, above_geom_lenient, above_bounds, lenient_bounds)
 
         # 3. Concentric insetting loop
         flat_starts = []
@@ -328,7 +333,7 @@ class Slicer:
         
         while current_inset and not current_inset.is_empty:
             inset_starts, had_outside_points = self._slice_flat_surface_inset(
-                z, current_inset, local_boxes, above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds
+                z, current_inset, local_boxes, above_geom, above_geom_lenient, above_bounds, lenient_bounds
             )
             flat_starts.extend(inset_starts)
             
@@ -588,20 +593,24 @@ class Slicer:
         positions: list[tuple[float, float, float]], 
         end_point: Point, 
         local_boxes: dict,
-        above_geom_prep,
+        above_geom,
         above_bounds
     ) -> Point | None:
-        for pos in reversed(positions[:-1]):
-            bx, by = pos[0], pos[1]
-            if above_geom_prep is not None:
-                if above_bounds is not None and (bx < above_bounds[0] or bx > above_bounds[2] or by < above_bounds[1] or by > above_bounds[3]):
-                    blocked = False
-                else:
-                    p = PolygonPoint(bx, by)
-                    blocked = above_geom_prep.contains(p)
-            else:
-                blocked = False
+        if not positions[:-1]:
+            return end_point
+            
+        # Batch check containment of all positions to grow backwards
+        if above_geom is not None and not above_geom.is_empty:
+            xs = [pos[0] for pos in positions[:-1]]
+            ys = [pos[1] for pos in positions[:-1]]
+            blocked_array = shapely.contains_xy(above_geom, xs, ys)
+        else:
+            blocked_array = [False] * len(positions[:-1])
 
+        n = len(positions[:-1])
+        for idx, pos in enumerate(reversed(positions[:-1])):
+            orig_idx = n - 1 - idx
+            blocked = blocked_array[orig_idx]
             if blocked:
                 return end_point
 
@@ -623,8 +632,8 @@ class Slicer:
         z: float, 
         polygon: Polygon, 
         local_boxes: dict, 
-        above_geom_prep, 
-        above_geom_lenient_prep,
+        above_geom, 
+        above_geom_lenient,
         above_bounds,
         lenient_bounds
     ) -> tuple[List[Point], bool]:
@@ -633,7 +642,7 @@ class Slicer:
             had_outside = False
             for sub_poly in polygon.geoms:
                 sub_starts, sub_outside = self._slice_flat_surface_inset(
-                    z, sub_poly, local_boxes, above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds
+                    z, sub_poly, local_boxes, above_geom, above_geom_lenient, above_bounds, lenient_bounds
                 )
                 starts.extend(sub_starts)
                 if sub_outside:
@@ -645,7 +654,7 @@ class Slicer:
             had_outside = False
             for geom in polygon.geoms:
                 sub_starts, sub_outside = self._slice_flat_surface_inset(
-                    z, geom, local_boxes, above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds
+                    z, geom, local_boxes, above_geom, above_geom_lenient, above_bounds, lenient_bounds
                 )
                 starts.extend(sub_starts)
                 if sub_outside:
@@ -659,47 +668,58 @@ class Slicer:
         if len(coords) < 2:
             return [], False
 
-        polygon_start_points = []
+        # 1. Pre-generate all sampled coordinates along the boundary
+        sampled_coords = []
         prev_coord = (coords[0][0], coords[0][1], z)
-        prev_point: Point | None = None
+        segment_lengths = []
+        for coord2d in coords:
+            coord = (coord2d[0], coord2d[1], z)
+            segment_points = self._points_to_point(prev_coord, coord)
+            segment_lengths.append(len(segment_points))
+            sampled_coords.extend(segment_points)
+            prev_coord = coord
+            
+        if not sampled_coords:
+            return [], False
 
-        if above_geom_prep is not None:
-            bx, by = prev_coord[0], prev_coord[1]
-            if above_bounds is not None and (bx < above_bounds[0] or bx > above_bounds[2] or by < above_bounds[1] or by > above_bounds[3]):
-                blocked = False
-            else:
-                p = PolygonPoint(bx, by)
-                blocked = above_geom_prep.contains(p)
+        # 2. Batch check containment of all sampled points
+        xs = [pos[0] for pos in sampled_coords]
+        ys = [pos[1] for pos in sampled_coords]
+        
+        if above_geom is not None and not above_geom.is_empty:
+            blocked_above = shapely.contains_xy(above_geom, xs, ys)
         else:
-            blocked = False
+            blocked_above = np.zeros(len(sampled_coords), dtype=bool)
+            
+        if above_geom_lenient is not None and not above_geom_lenient.is_empty:
+            blocked_lenient = shapely.contains_xy(above_geom_lenient, xs, ys)
+        else:
+            blocked_lenient = np.zeros(len(sampled_coords), dtype=bool)
 
-        if not blocked:
-            prev_point = self._check_pos(prev_coord, None, local_boxes, multiple=1.0)
+        # 3. Process points sequentially using precomputed arrays
+        polygon_start_points = []
+        
+        if blocked_above[0]:
+            prev_point = None
+        else:
+            prev_point = self._check_pos(sampled_coords[0], None, local_boxes, multiple=1.0)
             if prev_point is not None:
                 polygon_start_points.append(prev_point)
 
         past_coords = []
-        for coord2d in coords:
+        global_idx = 0
+        
+        prev_coord = (coords[0][0], coords[0][1], z)
+        for coord2d, seg_len in zip(coords, segment_lengths):
             coord = (coord2d[0], coord2d[1], z)
-            for pos in self._points_to_point(prev_coord, coord):
+            for _ in range(seg_len):
+                pos = sampled_coords[global_idx]
                 past_coords.append(pos)
                 
-                # Check if this point is blocked by the above layer
-                bx, by = pos[0], pos[1]
-                if prev_point is not None and above_geom_lenient_prep is not None:
-                    if lenient_bounds is not None and (bx < lenient_bounds[0] or bx > lenient_bounds[2] or by < lenient_bounds[1] or by > lenient_bounds[3]):
-                        blocked = False
-                    else:
-                        p_pos = PolygonPoint(bx, by)
-                        blocked = above_geom_lenient_prep.contains(p_pos)
-                elif prev_point is None and above_geom_prep is not None:
-                    if above_bounds is not None and (bx < above_bounds[0] or bx > above_bounds[2] or by < above_bounds[1] or by > above_bounds[3]):
-                        blocked = False
-                    else:
-                        p_pos = PolygonPoint(bx, by)
-                        blocked = above_geom_prep.contains(p_pos)
+                if prev_point is not None:
+                    blocked = blocked_lenient[global_idx]
                 else:
-                    blocked = False
+                    blocked = blocked_above[global_idx]
                 
                 if blocked:
                     prev_point = None
@@ -709,13 +729,14 @@ class Slicer:
                     if point is not None:
                         if prev_point is None:
                             start_point = self._grow_line_backwards_flat(
-                                past_coords, point, local_boxes, above_geom_prep, above_bounds
+                                past_coords, point, local_boxes, above_geom, above_bounds
                             )
                             if start_point is not None:
                                 polygon_start_points.append(start_point)
                         prev_point = point
                     else:
                         prev_point = None
+                global_idx += 1
             prev_coord = coord
             
         for line_start in polygon_start_points[:]:
@@ -723,17 +744,24 @@ class Slicer:
                 polygon_start_points.remove(line_start)
                 self._remove_line(line_start, local_boxes)
 
-        had_outside_points = False
+        # 4. Check if any surviving point is outside above_geom
+        surviving_coords = []
         for line_start in polygon_start_points:
             curr = line_start
             while curr is not None:
-                p_curr = PolygonPoint(curr.x, curr.y)
-                if above_geom_prep is None or not above_geom_prep.contains(p_curr):
-                    had_outside_points = True
-                    break
+                surviving_coords.append((curr.x, curr.y))
                 curr = curr.next
-            if had_outside_points:
-                break
+                
+        if surviving_coords:
+            if above_geom is None or above_geom.is_empty:
+                had_outside_points = True
+            else:
+                s_xs = [c[0] for c in surviving_coords]
+                s_ys = [c[1] for c in surviving_coords]
+                contained = shapely.contains_xy(above_geom, s_xs, s_ys)
+                had_outside_points = not np.all(contained)
+        else:
+            had_outside_points = False
                 
         return polygon_start_points, had_outside_points
 
@@ -767,15 +795,29 @@ class Slicer:
 
     def _check_pos(self, pos: tuple[float, float, float], prev: Point | None, local_boxes: dict, multiple: float) -> Point | None:
         box_coord = self._to_box_coord(pos)
-        x_range = range(-1, 2)
-        y_range = range(-1, 2)
-        z_range = range(-1, 1)
-        for x, y, z in itertools.product(x_range, y_range, z_range):
-            coord = (box_coord[0]+x, box_coord[1]+y, box_coord[2]+z)
-            if self._check_box_against_pos(coord, pos, local_boxes, mutliple=multiple):
-                return None
+        bx, by, bz = box_coord
+        px, py, pz = pos
+        inv_denom_width = self.inv_denom_width
+        inv_denom_height = self.inv_denom_height
+        limit = 0.99 * multiple
+
+        for dx, dy, dz in self._box_offsets:
+            coord = (bx + dx, by + dy, bz + dz)
+            if coord in local_boxes:
+                for point in local_boxes[coord]:
+                    if point.z == pz:
+                        continue
+                    dx_val = point.x - px
+                    dy_val = point.y - py
+                    dz_val = point.z - pz
+                    x_component = (dx_val * dx_val) * inv_denom_width
+                    y_component = (dy_val * dy_val) * inv_denom_width
+                    z_component = (dz_val * dz_val) * inv_denom_height
+
+                    if x_component + y_component + z_component < limit:
+                        return None
                 
-        point = Point(pos[0], pos[1], pos[2], prev)
+        point = Point(px, py, pz, prev)
         if prev is not None:
             prev.next = point
 
@@ -783,26 +825,6 @@ class Slicer:
             local_boxes[box_coord] = []
         local_boxes[box_coord].append(point)
         return point
-
-    def _check_box_against_pos(self, box_coord: tuple[int, int, int], pos: tuple[float, float, float], local_boxes: dict, mutliple: float) -> bool:
-        if box_coord not in local_boxes:
-            return False
-            
-        box = local_boxes[box_coord]
-        denom_width = self.horizontal_detection_distance ** 2
-        denom_height = self.z_detection_distance ** 2
-        
-        for point in box:
-            if point.z == pos[2]:
-                continue
-            x_component = ((point.x - pos[0]) ** 2) / denom_width
-            y_component = ((point.y - pos[1]) ** 2) / denom_width
-            z_component = ((point.z - pos[2]) ** 2) / denom_height
-
-            result = x_component + y_component + z_component
-            if result < 0.99 * mutliple:
-                return True
-        return False
 
     def _to_box_coord(self, pos: tuple[float, float, float]) -> tuple[int, int, int]:
         box_x = int(pos[0] // self.box_width)
