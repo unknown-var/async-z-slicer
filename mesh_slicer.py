@@ -239,6 +239,13 @@ class Slicer:
         first_layer_done = False
         profiler = SlicerProfiler.get_instance()
 
+        # Precompute all polygons for this pass using multi-plane slicing
+        heights_to_slice = []
+        for z in z_values:
+            heights_to_slice.append(z)
+            heights_to_slice.append(z + self.z_sample_height)
+        self._precompute_mesh_polygons(mesh, heights_to_slice)
+
         for z in z_values:
             profiler.start("2.a. Plane Intersections")
             polygons = self._polygons_at_z(mesh, z)
@@ -301,7 +308,7 @@ class Slicer:
         mesh: trimesh.Trimesh, 
         local_boxes: dict
     ) -> List[Point]:
-        from shapely.ops import unary_union
+        from shapely.geometry import GeometryCollection
 
         above_z = round(z + self.z_sample_height, 6)
         cache_key = (id(mesh), above_z)
@@ -311,19 +318,14 @@ class Slicer:
         else:
             # 1. Retrieve polygons of the above layer (at z + z_sample_height)
             polygons_above = self._polygons_at_z(mesh, above_z)
-            above_geom = unary_union(polygons_above)
-            if not above_geom.is_empty:
-                shapely.prepare(above_geom)
-
-            # 2. Prepare lenient geometry using the flat_surface_bias
-            bias_distance = self.flat_surface_bias
-            above_geom_lenient = above_geom.buffer(-bias_distance) if (not above_geom.is_empty and bias_distance > 0) else above_geom
-            if not above_geom_lenient.is_empty:
-                shapely.prepare(above_geom_lenient)
+            above_geom = GeometryCollection(polygons_above)
             
-            above_bounds = above_geom.bounds if not above_geom.is_empty else None
-            lenient_bounds = above_geom_lenient.bounds if not above_geom_lenient.is_empty else None
+            # Defer lenient geometry until it's needed
+            above_geom_lenient = None
+            above_bounds = None
+            lenient_bounds = None
             
+            # Cache the base geometry (lenient will be added to cache if computed later)
             if hasattr(self, '_above_geom_cache'):
                 self._above_geom_cache[cache_key] = (above_geom, above_geom_lenient, above_bounds, lenient_bounds)
 
@@ -332,6 +334,25 @@ class Slicer:
         current_inset = polygon.buffer(-self.horizontal_detection_distance)
         
         while current_inset and not current_inset.is_empty:
+            if above_geom is not None and not above_geom.is_empty:
+                is_within = current_inset.within(above_geom)
+                if is_within:
+                    break
+
+                # Lazy evaluate lenient geometry
+                if above_geom_lenient is None:
+                    bias_distance = self.flat_surface_bias
+                    above_geom_lenient = above_geom.buffer(-bias_distance) if bias_distance > 0 else above_geom
+                    if not above_geom_lenient.is_empty:
+                        shapely.prepare(above_geom_lenient)
+                    # And prepare the strict geometry since we will need it for point checks
+                    shapely.prepare(above_geom)
+                    
+                    above_bounds = above_geom.bounds
+                    lenient_bounds = above_geom_lenient.bounds if not above_geom_lenient.is_empty else None
+                    if hasattr(self, '_above_geom_cache'):
+                        self._above_geom_cache[cache_key] = (above_geom, above_geom_lenient, above_bounds, lenient_bounds)
+
             inset_starts, had_outside_points = self._slice_flat_surface_inset(
                 z, current_inset, local_boxes, above_geom, above_geom_lenient, above_bounds, lenient_bounds
             )
@@ -357,6 +378,9 @@ class Slicer:
         local_boxes: dict[tuple[int, int, int], list[Point]] = {}
         layer_dict: dict[float, list[Point]] = defaultdict(list)
         profiler = SlicerProfiler.get_instance()
+
+        # Precompute all infill polygons for this pass using multi-plane slicing
+        self._precompute_mesh_polygons(mesh, z_values)
 
         for layer_idx, z in enumerate(z_values):
             profiler.start("2.a. Plane Intersections")
@@ -853,21 +877,25 @@ class Slicer:
         return points
 
     def _polygons_at_z(self, mesh: trimesh.Trimesh, z: float) -> List[Polygon]:
+        profiler = SlicerProfiler.get_instance()
         cache_key = (id(mesh), round(z, 6))
         if hasattr(self, '_polygon_cache') and cache_key in self._polygon_cache:
             return self._polygon_cache[cache_key]
 
+        profiler.start("2.e.1 mesh_plane")
         segments_3d = trimesh.intersections.mesh_plane(
             mesh=mesh,
             plane_normal=[0.0, 0.0, 1.0],
             plane_origin=[0.0, 0.0, float(z)],
         )
+        profiler.stop("2.e.1 mesh_plane")
 
         if segments_3d is None or len(segments_3d) == 0:
             if hasattr(self, '_polygon_cache'):
                 self._polygon_cache[cache_key] = []
             return []
 
+        profiler.start("2.e.2 build_edges")
         scale = 1_000_000.0
         edge_set = set()
         neighbors = {}
@@ -890,11 +918,14 @@ class Slicer:
             neighbors.setdefault(a_key, []).append(b_key)
             neighbors.setdefault(b_key, []).append(a_key)
 
+        profiler.stop("2.e.2 build_edges")
+
         if not edge_set:
             if hasattr(self, '_polygon_cache'):
                 self._polygon_cache[cache_key] = []
             return []
 
+        profiler.start("2.e.3 loop_traversal")
         visited_edges = set()
         polygons: List[Polygon] = []
 
@@ -933,6 +964,9 @@ class Slicer:
                             polygons.append(poly)
                     break
 
+        profiler.stop("2.e.3 loop_traversal")
+        profiler.start("2.e.4 polygon_buffer")
+
         buffered_polygons = []
         half_nozzle = self.nozzle_diameter / 2.0
 
@@ -940,9 +974,116 @@ class Slicer:
             shrunk_poly = poly.buffer(-half_nozzle, join_style=2)
             buffered_polygons.extend(self._flatten_geometries(shrunk_poly))
 
+        profiler.stop("2.e.4 polygon_buffer")
+
         if hasattr(self, '_polygon_cache'):
             self._polygon_cache[cache_key] = buffered_polygons
         return buffered_polygons
+
+    def _precompute_mesh_polygons(self, mesh: trimesh.Trimesh, heights: np.ndarray | List[float]):
+        """
+        Slices the mesh at all specified heights using multiplane slicing
+        and populates self._polygon_cache.
+        """
+        profiler = SlicerProfiler.get_instance()
+        unique_heights = sorted(list(set(round(float(h), 6) for h in heights)))
+        if not unique_heights:
+            return
+
+        profiler.start("2.e.1 mesh_plane")
+        # Perform multi-plane intersection in a single call
+        lines_list, _, _ = trimesh.intersections.mesh_multiplane(
+            mesh=mesh,
+            plane_origin=[0.0, 0.0, 0.0],
+            plane_normal=[0.0, 0.0, 1.0],
+            heights=unique_heights
+        )
+        profiler.stop("2.e.1 mesh_plane")
+
+        half_nozzle = self.nozzle_diameter / 2.0
+        scale = 1_000_000.0
+
+        def key_from_point(p):
+            return (int(round(float(p[0]) * scale)), int(round(float(p[1]) * scale)))
+
+        def edge_key(a_key, b_key):
+            return (a_key, b_key) if a_key <= b_key else (b_key, a_key)
+
+        for z, segments_2d in zip(unique_heights, lines_list):
+            cache_key = (id(mesh), z)
+            if segments_2d is None or len(segments_2d) == 0:
+                self._polygon_cache[cache_key] = []
+                continue
+
+            # Build topology using the 2D segments directly
+            profiler.start("2.e.2 build_edges")
+            edge_set = set()
+            neighbors = {}
+
+            for seg in segments_2d:
+                a_key = key_from_point(seg[0])
+                b_key = key_from_point(seg[1])
+                if a_key == b_key:
+                    continue
+                e_key = edge_key(a_key, b_key)
+                if e_key in edge_set:
+                    continue
+                edge_set.add(e_key)
+                neighbors.setdefault(a_key, []).append(b_key)
+                neighbors.setdefault(b_key, []).append(a_key)
+            profiler.stop("2.e.2 build_edges")
+
+            if not edge_set:
+                self._polygon_cache[cache_key] = []
+                continue
+
+            profiler.start("2.e.3 loop_traversal")
+            visited_edges = set()
+            polygons = []
+
+            for a_start, b_start in list(edge_set):
+                start_edge = edge_key(a_start, b_start)
+                if start_edge in visited_edges:
+                    continue
+
+                loop = [a_start, b_start]
+                visited_edges.add(start_edge)
+                prev = a_start
+                curr = b_start
+
+                while True:
+                    candidates = []
+                    for nxt in neighbors.get(curr, []):
+                        e = edge_key(curr, nxt)
+                        if nxt != prev and e not in visited_edges:
+                            candidates.append(nxt)
+
+                    if not candidates:
+                        break
+
+                    nxt = candidates[0]
+                    visited_edges.add(edge_key(curr, nxt))
+                    loop.append(nxt)
+                    prev, curr = curr, nxt
+
+                    if curr == loop[0]:
+                        coords = [(k[0] / scale, k[1] / scale) for k in loop[:-1]]
+                        if len(coords) >= 3:
+                            poly = Polygon(coords)
+                            min_area = self.nozzle_diameter * 0.1
+                            if poly.is_valid and poly.area > min_area:
+                                polygons.append(poly)
+                        break
+            profiler.stop("2.e.3 loop_traversal")
+
+            profiler.start("2.e.4 polygon_buffer")
+            buffered_polygons = []
+            for poly in polygons:
+                shrunk_poly = poly.buffer(-half_nozzle, join_style=2)
+                buffered_polygons.extend(self._flatten_geometries(shrunk_poly))
+            profiler.stop("2.e.4 polygon_buffer")
+
+            self._polygon_cache[cache_key] = buffered_polygons
 
     def _flatten_geometries(self, geometry):
         if geometry.is_empty:
