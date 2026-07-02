@@ -114,6 +114,8 @@ class Slicer:
         Slice the mesh into independent wall layers and merge by global Z height.
         Returns a list of layers, where each layer contains a list of start Points.
         """
+        self._polygon_cache = {}
+        self._above_geom_cache = {}
         z_min = float(self.main_mesh.bounds[0][2])
         z_max = float(self.main_mesh.bounds[1][2])
 
@@ -298,15 +300,27 @@ class Slicer:
         from shapely.ops import unary_union
         from shapely.prepared import prep
 
-        # 1. Retrieve polygons of the above layer (at z + z_sample_height)
-        polygons_above = self._polygons_at_z(mesh, z + self.z_sample_height)
-        above_geom = unary_union(polygons_above)
-        above_geom_prep = prep(above_geom) if not above_geom.is_empty else None
+        above_z = round(z + self.z_sample_height, 6)
+        cache_key = (id(mesh), above_z)
+        
+        if hasattr(self, '_above_geom_cache') and cache_key in self._above_geom_cache:
+            above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds = self._above_geom_cache[cache_key]
+        else:
+            # 1. Retrieve polygons of the above layer (at z + z_sample_height)
+            polygons_above = self._polygons_at_z(mesh, above_z)
+            above_geom = unary_union(polygons_above)
+            above_geom_prep = prep(above_geom) if not above_geom.is_empty else None
 
-        # 2. Prepare lenient geometry using the flat_surface_bias
-        bias_distance = self.flat_surface_bias
-        above_geom_lenient = above_geom.buffer(-bias_distance) if (not above_geom.is_empty and bias_distance > 0) else above_geom
-        above_geom_lenient_prep = prep(above_geom_lenient) if not above_geom_lenient.is_empty else None
+            # 2. Prepare lenient geometry using the flat_surface_bias
+            bias_distance = self.flat_surface_bias
+            above_geom_lenient = above_geom.buffer(-bias_distance) if (not above_geom.is_empty and bias_distance > 0) else above_geom
+            above_geom_lenient_prep = prep(above_geom_lenient) if not above_geom_lenient.is_empty else None
+            
+            above_bounds = above_geom.bounds if not above_geom.is_empty else None
+            lenient_bounds = above_geom_lenient.bounds if not above_geom_lenient.is_empty else None
+            
+            if hasattr(self, '_above_geom_cache'):
+                self._above_geom_cache[cache_key] = (above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds)
 
         # 3. Concentric insetting loop
         flat_starts = []
@@ -314,7 +328,7 @@ class Slicer:
         
         while current_inset and not current_inset.is_empty:
             inset_starts, had_outside_points = self._slice_flat_surface_inset(
-                z, current_inset, local_boxes, above_geom_prep, above_geom_lenient_prep
+                z, current_inset, local_boxes, above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds
             )
             flat_starts.extend(inset_starts)
             
@@ -574,11 +588,21 @@ class Slicer:
         positions: list[tuple[float, float, float]], 
         end_point: Point, 
         local_boxes: dict,
-        above_geom_prep
+        above_geom_prep,
+        above_bounds
     ) -> Point | None:
         for pos in reversed(positions[:-1]):
-            p = PolygonPoint(pos[0], pos[1])
-            if above_geom_prep is not None and above_geom_prep.contains(p):
+            bx, by = pos[0], pos[1]
+            if above_geom_prep is not None:
+                if above_bounds is not None and (bx < above_bounds[0] or bx > above_bounds[2] or by < above_bounds[1] or by > above_bounds[3]):
+                    blocked = False
+                else:
+                    p = PolygonPoint(bx, by)
+                    blocked = above_geom_prep.contains(p)
+            else:
+                blocked = False
+
+            if blocked:
                 return end_point
 
             point = self._check_if_pos_is_point(pos, local_boxes=local_boxes)
@@ -600,14 +624,16 @@ class Slicer:
         polygon: Polygon, 
         local_boxes: dict, 
         above_geom_prep, 
-        above_geom_lenient_prep
+        above_geom_lenient_prep,
+        above_bounds,
+        lenient_bounds
     ) -> tuple[List[Point], bool]:
         if isinstance(polygon, MultiPolygon):
             starts = []
             had_outside = False
             for sub_poly in polygon.geoms:
                 sub_starts, sub_outside = self._slice_flat_surface_inset(
-                    z, sub_poly, local_boxes, above_geom_prep, above_geom_lenient_prep
+                    z, sub_poly, local_boxes, above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds
                 )
                 starts.extend(sub_starts)
                 if sub_outside:
@@ -619,7 +645,7 @@ class Slicer:
             had_outside = False
             for geom in polygon.geoms:
                 sub_starts, sub_outside = self._slice_flat_surface_inset(
-                    z, geom, local_boxes, above_geom_prep, above_geom_lenient_prep
+                    z, geom, local_boxes, above_geom_prep, above_geom_lenient_prep, above_bounds, lenient_bounds
                 )
                 starts.extend(sub_starts)
                 if sub_outside:
@@ -637,9 +663,13 @@ class Slicer:
         prev_coord = (coords[0][0], coords[0][1], z)
         prev_point: Point | None = None
 
-        p = PolygonPoint(prev_coord[0], prev_coord[1])
-        if above_geom_prep is not None and above_geom_prep.contains(p):
-            blocked = True
+        if above_geom_prep is not None:
+            bx, by = prev_coord[0], prev_coord[1]
+            if above_bounds is not None and (bx < above_bounds[0] or bx > above_bounds[2] or by < above_bounds[1] or by > above_bounds[3]):
+                blocked = False
+            else:
+                p = PolygonPoint(bx, by)
+                blocked = above_geom_prep.contains(p)
         else:
             blocked = False
 
@@ -655,11 +685,19 @@ class Slicer:
                 past_coords.append(pos)
                 
                 # Check if this point is blocked by the above layer
-                p_pos = PolygonPoint(pos[0], pos[1])
+                bx, by = pos[0], pos[1]
                 if prev_point is not None and above_geom_lenient_prep is not None:
-                    blocked = above_geom_lenient_prep.contains(p_pos)
+                    if lenient_bounds is not None and (bx < lenient_bounds[0] or bx > lenient_bounds[2] or by < lenient_bounds[1] or by > lenient_bounds[3]):
+                        blocked = False
+                    else:
+                        p_pos = PolygonPoint(bx, by)
+                        blocked = above_geom_lenient_prep.contains(p_pos)
                 elif prev_point is None and above_geom_prep is not None:
-                    blocked = above_geom_prep.contains(p_pos)
+                    if above_bounds is not None and (bx < above_bounds[0] or bx > above_bounds[2] or by < above_bounds[1] or by > above_bounds[3]):
+                        blocked = False
+                    else:
+                        p_pos = PolygonPoint(bx, by)
+                        blocked = above_geom_prep.contains(p_pos)
                 else:
                     blocked = False
                 
@@ -671,7 +709,7 @@ class Slicer:
                     if point is not None:
                         if prev_point is None:
                             start_point = self._grow_line_backwards_flat(
-                                past_coords, point, local_boxes, above_geom_prep
+                                past_coords, point, local_boxes, above_geom_prep, above_bounds
                             )
                             if start_point is not None:
                                 polygon_start_points.append(start_point)
@@ -793,6 +831,10 @@ class Slicer:
         return points
 
     def _polygons_at_z(self, mesh: trimesh.Trimesh, z: float) -> List[Polygon]:
+        cache_key = (id(mesh), round(z, 6))
+        if hasattr(self, '_polygon_cache') and cache_key in self._polygon_cache:
+            return self._polygon_cache[cache_key]
+
         segments_3d = trimesh.intersections.mesh_plane(
             mesh=mesh,
             plane_normal=[0.0, 0.0, 1.0],
@@ -800,6 +842,8 @@ class Slicer:
         )
 
         if segments_3d is None or len(segments_3d) == 0:
+            if hasattr(self, '_polygon_cache'):
+                self._polygon_cache[cache_key] = []
             return []
 
         scale = 1_000_000.0
@@ -825,6 +869,8 @@ class Slicer:
             neighbors.setdefault(b_key, []).append(a_key)
 
         if not edge_set:
+            if hasattr(self, '_polygon_cache'):
+                self._polygon_cache[cache_key] = []
             return []
 
         visited_edges = set()
@@ -872,6 +918,8 @@ class Slicer:
             shrunk_poly = poly.buffer(-half_nozzle, join_style=2)
             buffered_polygons.extend(self._flatten_geometries(shrunk_poly))
 
+        if hasattr(self, '_polygon_cache'):
+            self._polygon_cache[cache_key] = buffered_polygons
         return buffered_polygons
 
     def _flatten_geometries(self, geometry):

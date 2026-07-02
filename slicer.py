@@ -51,6 +51,9 @@ def main():
         sys.argv.remove('--perf')
         SlicerProfiler.get_instance().enable()
 
+    profiler = SlicerProfiler.get_instance()
+    profiler.start("Total execution time")
+
     if len(sys.argv) < 2:
         print("Usage: python slicer.py <stl_file> [printer_name|profile_name] [profile_name|output_gcode] [output_gcode] [--perf]")
         print()
@@ -163,6 +166,7 @@ def main():
     generator.save_gcode(output_gcode)
     print(f"✓ Saved to {output_gcode}")
 
+    profiler.stop("Total execution time")
     if perf_flag:
         SlicerProfiler.get_instance().save_report("perf_diagnostics")
 
