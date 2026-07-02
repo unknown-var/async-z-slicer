@@ -4,7 +4,7 @@ import math
 
 # Import components from our newly split slicer logic
 from mesh_slicer import Point, PrinterSettings
-
+from profiler import SlicerProfiler
 class GCodeGenerator:
     """Generates GCode from sliced layers"""
 
@@ -33,9 +33,12 @@ class GCodeGenerator:
         Returns:
             List of GCode lines
         """
+        profiler = SlicerProfiler.get_instance()
+        profiler.start("4. GCode generation (Total)")
         self._add_start_gcode()
         self._generate_layer_gcode()
         self._add_end_gcode()
+        profiler.stop("4. GCode generation (Total)")
         return self.gcode
 
     def _add_start_gcode(self):

@@ -10,6 +10,7 @@ import json
 from mesh_slicer import PrinterSettings, Slicer
 from gcode_generator import GCodeGenerator
 from path_optimizer import PathOptimizer
+from profiler import SlicerProfiler
 
 
 def _resolve_json_file(directory: Path, name: str) -> Path | None:
@@ -44,12 +45,18 @@ def _normalize_profile_settings(profile_settings: dict) -> dict:
 
 def main():
     """Command-line interface for the slicer"""
+    perf_flag = False
+    if '--perf' in sys.argv:
+        perf_flag = True
+        sys.argv.remove('--perf')
+        SlicerProfiler.get_instance().enable()
+
     if len(sys.argv) < 2:
-        print("Usage: python slicer.py <stl_file> [printer_name|profile_name] [profile_name|output_gcode] [output_gcode]")
+        print("Usage: python slicer.py <stl_file> [printer_name|profile_name] [profile_name|output_gcode] [output_gcode] [--perf]")
         print()
         print("Example:")
-        print("  python slicer.py model.stl")
-        print("  python slicer.py model.stl flashforge_finder fast output.gcode")
+        print("  python slicer.py model.stl --perf")
+        print("  python slicer.py model.stl flashforge_finder fast output.gcode --perf")
         print("  python slicer.py model.stl fast")
         print("  python slicer.py model.stl fast.json")
         sys.exit(1)
@@ -155,6 +162,9 @@ def main():
 
     generator.save_gcode(output_gcode)
     print(f"✓ Saved to {output_gcode}")
+
+    if perf_flag:
+        SlicerProfiler.get_instance().save_report("perf_diagnostics")
 
 
 if __name__ == '__main__':

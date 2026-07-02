@@ -4,6 +4,7 @@ import math
 
 # Import components from our newly split slicer logic
 from mesh_slicer import Point, PrinterSettings
+from profiler import SlicerProfiler
 
 class Line:
     def __init__(self, points: list[tuple[float, float, float]]):
@@ -25,10 +26,13 @@ class PathOptimizer:
         self._optimized_layers: list[list[list[tuple[float, float, float]]]] = []
 
     def optimize (self) -> list[list[list[tuple[float, float, float]]]]:
+        profiler = SlicerProfiler.get_instance()
+        profiler.start("3. Path optimization (Total)")
         start_point = None
         for layer in self.layers:
             optimized_layer, start_point = self._optimize_layer(layer, start_point)
             self._optimized_layers.append(optimized_layer)
+        profiler.stop("3. Path optimization (Total)")
         return self._optimized_layers
 
     def _optimize_layer(self, input_layer: list[Point], start_point: tuple[float, float, float] | None) -> tuple[list[list[tuple[float, float, float]]], tuple[float, float, float]]:
@@ -36,8 +40,13 @@ class PathOptimizer:
             Takes the start point from the previous layer and efficiently orders paths.
             Returns the optimized list of paths and the final position of the tool head.
             """
-            lines, loops = self._convert_layer(input_layer)
+            profiler = SlicerProfiler.get_instance()
             
+            profiler.start("3.a. Path Simplification / Conversion")
+            lines, loops = self._convert_layer(input_layer)
+            profiler.stop("3.a. Path Simplification / Conversion")
+            
+            profiler.start("3.b. Optimization Search")
             optimized_paths: list[list[tuple[float, float, float]]] = []
             
             # If no start point is provided (e.g., very first layer), default to the 
@@ -49,6 +58,7 @@ class PathOptimizer:
                 elif loops:
                     current_pos = loops[0].points[0]
                 else:
+                    profiler.stop("3.b. Optimization Search")
                     return [], (0.0, 0.0, 0.0) # Fallback for an empty layer
 
             # Helper function for 3D distance
@@ -114,6 +124,7 @@ class PathOptimizer:
                     optimized_paths.append(path)
                     current_pos = path[-1]
 
+            profiler.stop("3.b. Optimization Search")
             return optimized_paths, current_pos
 
     def _convert_layer (self, input_layer: List[Point]) -> tuple[list[Line], list[Loop]]:

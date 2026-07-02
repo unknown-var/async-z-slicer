@@ -9,3 +9,6 @@ myenvs/
 # Python caching
 __pycache__/
 *.pyc
+
+# Performance profiling diagnostics
+perf_diagnostics.*

@@ -12,6 +12,7 @@ from collections import defaultdict
 
 # Import the SDF generator
 from sdf_generator import generate_inset_mesh
+from profiler import SlicerProfiler
 
 # This is the bias which decides how much shorter the distance to a point has to be if the last point was in a line
 LONG_LINE_SAMPLE_BIAS = 0.9
@@ -130,8 +131,11 @@ class Slicer:
         # Group starting Point objects by Z height: dict[Z_Height, list[Point]]
         combined_layers: dict[float, list[Point]] = defaultdict(list)
 
+        profiler = SlicerProfiler.get_instance()
+
         for wall_idx in range(self.num_walls):
-            print(f"--- Wall {wall_idx + 1}/{self.num_walls} ---")
+            pass_name = f"Wall {wall_idx + 1}"
+            print(f"--- {pass_name}/{self.num_walls} ---")
             
             # Use 0.5 * nozzle_diameter to place the centerline correctly
             h_offset = (wall_idx + 0.5) * self.nozzle_diameter
@@ -140,12 +144,15 @@ class Slicer:
             v_offset = (wall_idx + 0.5) * self.horizontal_detection_distance * self.vertical_offset_multiple
             
             print(f"Generating inset mesh (offset={h_offset:.2f}mm)...")
+            profiler.start("1. SDF models shrinking")
             current_mesh = generate_inset_mesh(
                 self.main_mesh, 
                 horizontal_offset=h_offset, 
                 vertical_offset=v_offset,
                 pitch=0.1
             )
+            t_sdf = profiler.stop("1. SDF models shrinking")
+            profiler.record_pass_time(pass_name, "SDF models shrinking", t_sdf)
             
             if current_mesh is None:
                 print(f"Geometry collapsed at wall {wall_idx + 1}. Stopping inner walls.")
@@ -158,23 +165,29 @@ class Slicer:
 
             # Process mesh independently to allow for future parallelization
             print(f"Slicing paths from mesh...")
-            wall_starts = self._process_single_mesh(current_mesh, global_z_values)
+            profiler.start("2. Mesh slicing (Total)")
+            wall_starts = self._process_single_mesh(current_mesh, global_z_values, pass_name)
+            profiler.stop("2. Mesh slicing (Total)")
             
             for z, start_points in wall_starts.items():
                 combined_layers[z].extend(start_points)
 
         if self.infill:
+            pass_name = "Infill"
             print("--- Infill ---")
             infill_h_offset = self.num_walls * self.nozzle_diameter
             infill_v_offset = self.num_walls * self.horizontal_detection_distance * self.vertical_offset_multiple
             
             print(f"Generating infill mesh (offset={infill_h_offset:.2f}mm)...")
+            profiler.start("1. SDF models shrinking")
             infill_mesh = generate_inset_mesh(
                 self.main_mesh,
                 horizontal_offset=infill_h_offset,
                 vertical_offset=infill_v_offset,
                 pitch=0.1
             )
+            t_sdf = profiler.stop("1. SDF models shrinking")
+            profiler.record_pass_time(pass_name, "SDF models shrinking", t_sdf)
             
             if infill_mesh is not None:
                 if self.debug:
@@ -184,7 +197,9 @@ class Slicer:
                 
                 print("Slicing infill paths from mesh...")
                 infill_z_values = np.arange(z_start, z_stop, self.layer_height)
-                infill_starts = self._process_infill_mesh(infill_mesh, infill_z_values)
+                profiler.start("2. Mesh slicing (Total)")
+                infill_starts = self._process_infill_mesh(infill_mesh, infill_z_values, pass_name)
+                profiler.stop("2. Mesh slicing (Total)")
                 
                 for z, start_points in infill_starts.items():
                     combined_layers[z].extend(start_points)
@@ -206,7 +221,8 @@ class Slicer:
     def _process_single_mesh(
         self, 
         mesh: trimesh.Trimesh, 
-        z_values: np.ndarray
+        z_values: np.ndarray,
+        pass_name: str
     ) -> dict[float, list[Point]]:
         """
         Slices a single mesh and maintains isolated state.
@@ -215,9 +231,14 @@ class Slicer:
         local_boxes: dict[tuple[int, int, int], list[Point]] = {}
         layer_dict: dict[float, list[Point]] = defaultdict(list)
         first_layer_done = False
+        profiler = SlicerProfiler.get_instance()
 
         for z in z_values:
+            profiler.start("2.a. Plane Intersections")
             polygons = self._polygons_at_z(mesh, z)
+            t_plane = profiler.stop("2.a. Plane Intersections")
+            profiler.record_pass_time(pass_name, "2.a. Plane Intersections", t_plane)
+            
             valid_polygons = [p for p in polygons if p and not p.is_empty]
             if not valid_polygons:
                 continue
@@ -227,18 +248,40 @@ class Slicer:
             if not first_layer_done:
                 for polygon in valid_polygons:
                     if self.solid_bottom_layer:
-                        layer_line_starts.extend(self._slice_polygon_solid(z, polygon, local_boxes))
+                        profiler.start("2.b. Normal Wall Slicing")
+                        normal_starts = self._slice_polygon_solid(z, polygon, local_boxes)
+                        t_wall = profiler.stop("2.b. Normal Wall Slicing")
+                        profiler.record_pass_time(pass_name, "2.b. Normal Wall Slicing", t_wall)
+                        layer_line_starts.extend(normal_starts)
                     else:
-                        layer_line_starts.extend(self._slice_polygon(z, polygon, local_boxes))
-                        layer_line_starts.extend(self._generate_flat_surfaces_for_polygon(z, polygon, mesh, local_boxes))
+                        profiler.start("2.b. Normal Wall Slicing")
+                        normal_starts = self._slice_polygon(z, polygon, local_boxes)
+                        t_wall = profiler.stop("2.b. Normal Wall Slicing")
+                        profiler.record_pass_time(pass_name, "2.b. Normal Wall Slicing", t_wall)
+                        layer_line_starts.extend(normal_starts)
+                        
+                        profiler.start("2.c. Flat Surface Slicing")
+                        flat_starts = self._generate_flat_surfaces_for_polygon(z, polygon, mesh, local_boxes)
+                        t_flat = profiler.stop("2.c. Flat Surface Slicing")
+                        profiler.record_pass_time(pass_name, "2.c. Flat Surface Slicing", t_flat)
+                        layer_line_starts.extend(flat_starts)
                 if layer_line_starts:
                     if self.solid_bottom_layer:
                         print(f"✓ Sliced first wall layer at Z={z:.3f}mm as solid fill (paths={len(layer_line_starts)})")
                     first_layer_done = True
             else:
                 for polygon in valid_polygons:
-                    layer_line_starts.extend(self._slice_polygon(z, polygon, local_boxes))
-                    layer_line_starts.extend(self._generate_flat_surfaces_for_polygon(z, polygon, mesh, local_boxes))
+                    profiler.start("2.b. Normal Wall Slicing")
+                    normal_starts = self._slice_polygon(z, polygon, local_boxes)
+                    t_wall = profiler.stop("2.b. Normal Wall Slicing")
+                    profiler.record_pass_time(pass_name, "2.b. Normal Wall Slicing", t_wall)
+                    layer_line_starts.extend(normal_starts)
+                    
+                    profiler.start("2.c. Flat Surface Slicing")
+                    flat_starts = self._generate_flat_surfaces_for_polygon(z, polygon, mesh, local_boxes)
+                    t_flat = profiler.stop("2.c. Flat Surface Slicing")
+                    profiler.record_pass_time(pass_name, "2.c. Flat Surface Slicing", t_flat)
+                    layer_line_starts.extend(flat_starts)
             
             if layer_line_starts:
                 layer_dict[z].extend(layer_line_starts)
@@ -286,16 +329,22 @@ class Slicer:
     def _process_infill_mesh(
         self, 
         mesh: trimesh.Trimesh, 
-        z_values: np.ndarray
+        z_values: np.ndarray,
+        pass_name: str
     ) -> dict[float, list[Point]]:
         """
         Slices the infill mesh at standard layer heights and generates parallel infill lines.
         """
         local_boxes: dict[tuple[int, int, int], list[Point]] = {}
         layer_dict: dict[float, list[Point]] = defaultdict(list)
+        profiler = SlicerProfiler.get_instance()
 
         for layer_idx, z in enumerate(z_values):
+            profiler.start("2.a. Plane Intersections")
             polygons = self._polygons_at_z(mesh, z)
+            t_plane = profiler.stop("2.a. Plane Intersections")
+            profiler.record_pass_time(pass_name, "2.a. Plane Intersections", t_plane)
+            
             valid_polygons = [p for p in polygons if p and not p.is_empty]
             if not valid_polygons:
                 continue
@@ -305,8 +354,11 @@ class Slicer:
             layer_line_starts: list[Point] = []
 
             for polygon in valid_polygons:
+                profiler.start("2.d. Infill Slicing")
                 # Generate infill lines inside this polygon
                 infill_starts = self._slice_polygon_infill(z, polygon, angle, local_boxes)
+                t_infill = profiler.stop("2.d. Infill Slicing")
+                profiler.record_pass_time(pass_name, "2.d. Infill Slicing", t_infill)
                 layer_line_starts.extend(infill_starts)
 
             if layer_line_starts:
