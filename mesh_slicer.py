@@ -81,6 +81,32 @@ class Slicer:
         self.bed_height = printer_settings.get('bed_height')
         self.nozzle_diameter = printer_settings.get('nozzle_diameter', 0.4)
         
+        # Center the model on the bed according to the bed origin type
+        if self.bed_width is not None and self.bed_height is not None:
+            bounds = self.main_mesh.bounds
+            model_center_x = (bounds[0][0] + bounds[1][0]) / 2.0
+            model_center_y = (bounds[0][1] + bounds[1][1]) / 2.0
+            
+            model_min_z = bounds[0][2]
+            
+            center_origin = printer_settings.get('center_origin', False)
+            if center_origin:
+                target_center_x = 0.0
+                target_center_y = 0.0
+            else:
+                target_center_x = self.bed_width / 2.0
+                target_center_y = self.bed_height / 2.0
+                
+            target_min_z = 0.0
+            translation = [
+                target_center_x - model_center_x,
+                target_center_y - model_center_y,
+                target_min_z - model_min_z
+            ]
+            if any(abs(t) > 1e-5 for t in translation):
+                self.main_mesh.apply_translation(translation)
+                print(f"✓ Centered model: translated by X: {translation[0]:.2f}, Y: {translation[1]:.2f}, Z: {translation[2]:.2f} to align with bed")
+        
         self.box_height = self.layer_height
         self.box_width = self.nozzle_diameter
         self.point_spacing = printer_settings.get('point_spacing', printer_settings.get('POINT_SPACING', POINT_SPACING))
@@ -126,7 +152,7 @@ class Slicer:
         print(f"Model Z range: {z_min:.2f} to {z_max:.2f} mm")
         
         epsilon = 1e-6
-        z_start = z_min + epsilon
+        z_start = z_min + self.layer_height
         z_stop = z_max - epsilon
         if z_stop <= z_start:
             return []

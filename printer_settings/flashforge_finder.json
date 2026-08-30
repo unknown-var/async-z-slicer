@@ -1,5 +1,7 @@
 {
   "printer_name": "Flashforge Finder 2",
+  "center_origin": true,
+  "layer_height_indicator": ";layer:{layer_height:.2f}",
   "bed_width": 140,
   "bed_height": 140,
   "bed_depth": 140,
@@ -25,6 +27,7 @@
     "M104 S{nozzle_temp} T0 ; Set nozzle temp",
     "M104 S0 T1 ; Force off unused second extruder",
     "G90 ; Absolute positioning",
+    "M82 ; Absolute extrusion mode",
     "G28 ; Home axes",
     "M132 X Y Z A B ; Recall FlashForge home offsets",
     "G1 Z50.000 F420 ; Lower bed to safe distance",

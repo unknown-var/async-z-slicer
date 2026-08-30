@@ -77,7 +77,7 @@ Printer settings are JSON files with the following structure:
   "bed_height": 140,
   "bed_depth": 140,
   "nozzle_diameter": 0.4,
-  "default_layer_height": 0.3,
+  "default_layer_height": 0.28,
   "default_print_speed": 2400,
   "default_nozzle_temp": 210,
   "default_bed_temp": 0,
@@ -92,9 +92,11 @@ Printer settings are JSON files with the following structure:
   "extrusion_factor": 0.04,
   "start_gcode": [
     "G90 ; Absolute positioning",
+    "M82 ; Absolute extrusion mode",
     "G28 ; Home axes",
     "M104 S{nozzle_temp} ; Set nozzle temp",
-    "M140 S{bed_temp} ; Set bed temp"
+    "M140 S{bed_temp} ; Set bed temp",
+    "M106 S255 ; Turn on fan"
   ],
   "end_gcode": [
     "M104 S0 ; Turn off heater",

@@ -69,7 +69,24 @@ class GCodeGenerator:
         for layer_idx, layer_traces in enumerate(self.layers):
             self.current_z = layer_traces[0][0][2]
 
-            self.gcode.append(";layer:0.30")
+            indicator_template = self.printer.get('layer_height_indicator', ';layer:{layer_height:.2f}')
+            if isinstance(indicator_template, str):
+                templates = [indicator_template]
+            else:
+                templates = indicator_template
+
+            format_dict = {
+                'layer_height': self.layer_height,
+                'layer_z': self.current_z,
+                'layer_num': layer_idx
+            }
+
+            for template in templates:
+                try:
+                    formatted_indicator = template.format(**format_dict)
+                    self.gcode.append(formatted_indicator)
+                except (KeyError, ValueError):
+                    self.gcode.append(template)
 
             # Move to layer height
             self.gcode.append(f"; Layer {layer_idx}")
@@ -89,6 +106,10 @@ class GCodeGenerator:
 
             # Move to start position
             self.gcode.append(f"G0 X{first_x:.3f} Y{first_y:.3f} F4800 ; Move to line start")
+
+            # Force specific width and height for slicer previewers (e.g., OrcaSlicer)
+            self.gcode.append(f";WIDTH:{self.nozzle_diameter * 1.1:.3f}")
+            self.gcode.append(f";HEIGHT:{self.layer_height:.3f}")
 
             # Draw the simplified lines
             for i in range(len(trace) - 1):
