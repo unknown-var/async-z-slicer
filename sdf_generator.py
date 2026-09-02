@@ -1,8 +1,24 @@
 import trimesh
 import numpy as np
+import os
 from skimage.measure import marching_cubes
 from trimesh.voxel import VoxelGrid
-from scipy.ndimage import distance_transform_edt
+
+# Use multi-threaded edt package if available, fall back to scipy
+try:
+    import edt as edt_lib
+    _num_threads = max(1, os.cpu_count() or 1)
+    def _edt(data: np.ndarray) -> np.ndarray:
+        """Multi-threaded Euclidean distance transform using the edt package."""
+        return edt_lib.edt(data, parallel=_num_threads)
+    _edt_backend = f"edt (multi-threaded, {_num_threads} threads)"
+except ImportError:
+    from scipy.ndimage import distance_transform_edt
+    def _edt(data: np.ndarray) -> np.ndarray:
+        """Fallback single-threaded EDT using scipy."""
+        return distance_transform_edt(data)
+    _edt_backend = "scipy (single-threaded)"
+
 
 def stl_to_sdf(mesh: trimesh.Trimesh, pitch: float, pad_voxels: int = 10) -> tuple[np.ndarray, VoxelGrid, np.ndarray]:
     """
@@ -35,9 +51,9 @@ def stl_to_sdf(mesh: trimesh.Trimesh, pitch: float, pad_voxels: int = 10) -> tup
     # outside = inverse
     outside = ~solid_padded
 
-    # distance transforms
-    dist_inside = distance_transform_edt(solid_padded)
-    dist_outside = distance_transform_edt(outside)
+    # distance transforms (uses multi-threaded edt if available)
+    dist_inside = _edt(solid_padded)
+    dist_outside = _edt(outside)
 
     sdf = dist_outside - dist_inside
     
@@ -45,6 +61,51 @@ def stl_to_sdf(mesh: trimesh.Trimesh, pitch: float, pad_voxels: int = 10) -> tup
     pad_offset = np.array([-pad_voxels * pitch] * 3)
     
     return sdf, vg, pad_offset
+
+
+class SDFCache:
+    """
+    Precomputes and caches a Signed Distance Field for a mesh at a given pitch and z_scale.
+    
+    The z_scale ratio (horizontal_offset / vertical_offset) is constant across all wall
+    and infill passes, so the expensive voxelization + EDT computation can be done once.
+    Each inset mesh is then generated cheaply by shifting the cached SDF iso-level
+    and running marching cubes.
+    """
+    
+    def __init__(self, mesh: trimesh.Trimesh, pitch: float, z_scale: float = 1.0, pad_voxels: int = 10):
+        self.pitch = pitch
+        self.z_scale = z_scale
+        self.pad_voxels = pad_voxels
+        
+        # Apply anisotropic Z-scale to the mesh
+        scaled_mesh = mesh.copy()
+        if z_scale != 1.0:
+            scaled_mesh.apply_scale([1.0, 1.0, z_scale])
+        
+        # Compute the full SDF (this is the expensive part: voxelization + 2× EDT)
+        self.sdf, self.vg, self.pad_offset = stl_to_sdf(scaled_mesh, pitch, pad_voxels=pad_voxels)
+        print(f"  SDF cache built: grid shape={self.sdf.shape}, EDT backend={_edt_backend}")
+    
+    def generate_inset(self, horizontal_offset: float) -> trimesh.Trimesh | None:
+        """
+        Generate an inset mesh from the cached SDF.
+        Only runs the cheap operations: SDF shift → marching cubes → Z-unscale → Laplacian smooth.
+        """
+        sdf_shifted = inset_sdf(self.sdf, self.pitch, inset_mm=horizontal_offset)
+        
+        # Reconstruct mesh from shifted SDF
+        inset_mesh = sdf_to_mesh(sdf_shifted, self.pitch, self.vg, self.pad_offset)
+        
+        # Undo the anisotropic Z-scale
+        if self.z_scale != 1.0:
+            inset_mesh.apply_scale([1.0, 1.0, 1.0 / self.z_scale])
+        
+        # Laplacian smoothing to reduce surface noise from voxelization
+        trimesh.smoothing.filter_laplacian(inset_mesh, iterations=3)
+        
+        return inset_mesh
+
 
 def inset_sdf(sdf: np.ndarray, pitch: float, inset_mm: float) -> np.ndarray:
     """
@@ -75,7 +136,8 @@ def generate_inset_mesh(
     mesh: trimesh.Trimesh, 
     horizontal_offset: float, 
     vertical_offset: float, 
-    pitch: float = 0.2
+    pitch: float = 0.2,
+    sdf_cache: SDFCache | None = None
 ) -> trimesh.Trimesh | None:
     """
     Generates an inner wall mesh using SDF.
@@ -87,10 +149,18 @@ def generate_inset_mesh(
     :param pitch: Voxel grid resolution / cell size in millimeters (mm).
                  Controls the discretization fineness of the Signed Distance Field.
                  Smaller values yield higher detail at the cost of compute time and RAM.
+    :param sdf_cache: Optional precomputed SDF cache. When provided, skips the
+                     expensive voxelization and EDT computation and only runs
+                     marching cubes + smoothing.
     """
     if horizontal_offset <= 0 and vertical_offset <= 0:
         return mesh.copy()
 
+    # Use cached SDF if available (fast path: only marching cubes + smooth)
+    if sdf_cache is not None:
+        return sdf_cache.generate_inset(horizontal_offset)
+
+    # Fallback: compute SDF from scratch when no cache is provided
     # Determine anisotropic scale factor
     z_scale = 1.0
     if vertical_offset > 0 and horizontal_offset > 0:

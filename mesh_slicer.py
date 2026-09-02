@@ -11,7 +11,7 @@ import itertools
 from collections import defaultdict
 import shapely
 # Import the SDF generator
-from sdf_generator import generate_inset_mesh
+from sdf_generator import generate_inset_mesh, SDFCache
 from profiler import SlicerProfiler
 
 # This is the bias which decides how much shorter the distance to a point has to be if the last point was in a line
@@ -168,6 +168,18 @@ class Slicer:
 
         profiler = SlicerProfiler.get_instance()
 
+        # Precompute SDF cache once — z_scale is constant across all wall and infill passes
+        # z_scale = nozzle_diameter / (horizontal_detection_distance * vertical_offset_multiple)
+        sdf_cache = None
+        if self.num_walls > 0 or self.infill:
+            denom = self.horizontal_detection_distance * self.vertical_offset_multiple
+            z_scale = self.nozzle_diameter / denom if denom > 0 else 1.0
+            print(f"Precomputing SDF cache (pitch={self.sdf_pitch}mm, z_scale={z_scale:.4f})...")
+            profiler.start("0. SDF cache precomputation")
+            sdf_cache = SDFCache(self.main_mesh, self.sdf_pitch, z_scale=z_scale, pad_voxels=10)
+            t_cache = profiler.stop("0. SDF cache precomputation")
+            print(f"SDF cache ready{f' in {t_cache:.2f}s' if t_cache else ''}")
+
         for wall_idx in range(self.num_walls):
             pass_name = f"Wall {wall_idx + 1}"
             print(f"--- {pass_name}/{self.num_walls} ---")
@@ -184,7 +196,8 @@ class Slicer:
                 self.main_mesh, 
                 horizontal_offset=h_offset, 
                 vertical_offset=v_offset,
-                pitch=self.sdf_pitch
+                pitch=self.sdf_pitch,
+                sdf_cache=sdf_cache
             )
             t_sdf = profiler.stop("1. SDF models shrinking")
             profiler.record_pass_time(pass_name, "SDF models shrinking", t_sdf)
@@ -219,7 +232,8 @@ class Slicer:
                 self.main_mesh,
                 horizontal_offset=infill_h_offset,
                 vertical_offset=infill_v_offset,
-                pitch=self.sdf_pitch
+                pitch=self.sdf_pitch,
+                sdf_cache=sdf_cache
             )
             t_sdf = profiler.stop("1. SDF models shrinking")
             profiler.record_pass_time(pass_name, "SDF models shrinking", t_sdf)

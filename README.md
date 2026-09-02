@@ -66,6 +66,51 @@ python slicer.py model.stl fast.json
 python slicer.py model.stl flashforge_finder fast output.gcode
 ```
 
+### Performance Profiling & Diagnostics
+
+The slicer includes a built-in profiling tool to benchmark execution times and identify bottlenecks across slicing stages (SDF mesh generation, plane slicing, path optimization, and GCode generation).
+
+To enable profiling, pass the `--perf` flag on the command line:
+
+```bash
+# Profile with default printer settings
+python slicer.py model.stl --perf
+
+# Profile with a specific profile
+python slicer.py model.stl fast --perf
+
+# Profile with printer, profile, and custom output path
+python slicer.py model.stl flashforge_finder fast output.gcode --perf
+```
+
+#### Generated Diagnostics Output
+
+When `--perf` is enabled, the slicer automatically writes two diagnostic reports to the working directory:
+
+1. **`perf_diagnostics.md`**: A human-readable Markdown report containing:
+   - **Summary of Categories**: Total time, call counts, average, minimum, and maximum time for each operation stage (e.g. SDF mesh generation, plane slicing, path optimization, GCode generation).
+   - **Per-Pass / Layer Breakdown**: Detailed duration breakdown comparing individual wall passes (`Wall 1`, `Wall 2`, etc.) and `Infill`.
+2. **`perf_diagnostics.json`**: Raw structured timing data in JSON format for automated analysis, CI benchmarks, or scripting.
+
+#### Programmatic Profiler Usage
+
+You can also use the profiler in custom scripts or new features via the `SlicerProfiler` singleton in `profiler.py`:
+
+```python
+from profiler import SlicerProfiler
+
+profiler = SlicerProfiler.get_instance()
+profiler.enable()
+
+# Time an operation
+profiler.start("Custom Operation")
+# ... execute operation ...
+profiler.stop("Custom Operation")
+
+# Save reports (generates custom_report.json and custom_report.md)
+profiler.save_report("custom_report")
+```
+
 ## Printer Settings Format
 
 Printer settings are JSON files with the following structure:
