@@ -468,7 +468,6 @@ class Slicer:
                 layer_line_starts.extend(infill_starts)
 
             if layer_line_starts:
-                print(f"✓ Sliced infill layer at Z={z:.3f}mm (paths={len(layer_line_starts)})")
                 layer_dict[z].extend(layer_line_starts)
 
         return layer_dict

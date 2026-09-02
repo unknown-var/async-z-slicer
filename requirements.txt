@@ -4,3 +4,4 @@ numpy
 mesh_to_sdf
 scikit-image
 edt
+fast-simplification

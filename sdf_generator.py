@@ -103,6 +103,9 @@ class SDFCache:
         
         # Laplacian smoothing to reduce surface noise from voxelization
         trimesh.smoothing.filter_laplacian(inset_mesh, iterations=3)
+
+        # Simplify high-poly marching cubes output to accelerate multi-plane slicing
+        inset_mesh = simplify_mesh(inset_mesh)
         
         return inset_mesh
 
@@ -130,6 +133,23 @@ def sdf_to_mesh(sdf: np.ndarray, pitch: float, vg: VoxelGrid, pad_offset: np.nda
     verts += vg.translation + pad_offset
 
     return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+
+def simplify_mesh(mesh: trimesh.Trimesh, min_faces: int = 10000, reduction_factor: int = 4) -> trimesh.Trimesh:
+    """
+    Simplify a high-poly mesh (e.g. from marching cubes) using quadric decimation.
+    Reduces triangle count by ~75% while keeping geometry within voxel tolerance,
+    which significantly speeds up subsequent multi-plane slicing.
+    """
+    if len(mesh.faces) > min_faces:
+        target_faces = max(len(mesh.faces) // reduction_factor, 5000)
+        try:
+            simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
+            if simplified is not None and len(simplified.faces) > 0:
+                return simplified
+        except Exception:
+            pass
+    return mesh
 
 
 def generate_inset_mesh(
@@ -187,5 +207,8 @@ def generate_inset_mesh(
 
     # Laplacian smoothing to reduce surface noise from voxelization
     trimesh.smoothing.filter_laplacian(inset_mesh, iterations=3)
+
+    # Simplify high-poly marching cubes output to accelerate multi-plane slicing
+    inset_mesh = simplify_mesh(inset_mesh)
 
     return inset_mesh
