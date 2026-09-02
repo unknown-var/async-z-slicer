@@ -29,6 +29,8 @@ Z_SAMPLES_PER_LAYER = 10
 
 POINT_SPACING = 0.1
 
+SDF_PITCH = 0.1
+
 class PrinterSettings:
     """Loads and manages printer configuration from JSON"""
     def __init__(self, settings_file: str):
@@ -128,10 +130,11 @@ class Slicer:
         self.solid_bottom_layer = printer_settings.get('solid_bottom_layer', printer_settings.get('SOLID_BOTTOM_LAYER', True))
         self.infill = printer_settings.get('infill', printer_settings.get('INFILL', True))
         self.infill_spacing = printer_settings.get('infill_spacing', printer_settings.get('INFILL_SPACING', 2.5))
+        self.sdf_pitch = float(printer_settings.get('sdf_pitch', printer_settings.get('pitch', printer_settings.get('SDF_PITCH', SDF_PITCH))))
         self.num_walls = printer_settings.get('number_of_walls', 1)
         self.debug = True # Set to True to export inset meshes as STL
         
-        print(f"✓ Slicing settings: point_spacing={self.point_spacing}, z_samples_per_layer={self.z_samples_per_layer}, horizontal_detection_distance_multiple={self.horizontal_detection_distance_multiple}, min_line_segments={self.min_line_segments}, long_line_sample_bias={self.long_line_sample_bias}, vertical_offset_multiple={self.vertical_offset_multiple}, solid_bottom_layer={self.solid_bottom_layer}, infill={self.infill}, infill_spacing={self.infill_spacing}")
+        print(f"✓ Slicing settings: point_spacing={self.point_spacing}, z_samples_per_layer={self.z_samples_per_layer}, horizontal_detection_distance_multiple={self.horizontal_detection_distance_multiple}, min_line_segments={self.min_line_segments}, long_line_sample_bias={self.long_line_sample_bias}, vertical_offset_multiple={self.vertical_offset_multiple}, solid_bottom_layer={self.solid_bottom_layer}, infill={self.infill}, infill_spacing={self.infill_spacing}, sdf_pitch={self.sdf_pitch}")
 
         self.inv_denom_width = 1.0 / (self.horizontal_detection_distance ** 2) if self.horizontal_detection_distance != 0 else 0.0
         self.inv_denom_height = 1.0 / (self.z_detection_distance ** 2) if self.z_detection_distance != 0 else 0.0
@@ -181,7 +184,7 @@ class Slicer:
                 self.main_mesh, 
                 horizontal_offset=h_offset, 
                 vertical_offset=v_offset,
-                pitch=0.1
+                pitch=self.sdf_pitch
             )
             t_sdf = profiler.stop("1. SDF models shrinking")
             profiler.record_pass_time(pass_name, "SDF models shrinking", t_sdf)
@@ -216,7 +219,7 @@ class Slicer:
                 self.main_mesh,
                 horizontal_offset=infill_h_offset,
                 vertical_offset=infill_v_offset,
-                pitch=0.1
+                pitch=self.sdf_pitch
             )
             t_sdf = profiler.stop("1. SDF models shrinking")
             profiler.record_pass_time(pass_name, "SDF models shrinking", t_sdf)
@@ -337,50 +340,70 @@ class Slicer:
         from shapely.geometry import GeometryCollection
 
         above_z = round(z + self.z_sample_height, 6)
-        cache_key = (id(mesh), above_z)
+        below_z = round(z - self.z_sample_height, 6)
         
-        if hasattr(self, '_above_geom_cache') and cache_key in self._above_geom_cache:
-            above_geom, above_geom_lenient, above_bounds, lenient_bounds = self._above_geom_cache[cache_key]
-        else:
-            # 1. Retrieve polygons of the above layer (at z + z_sample_height)
-            polygons_above = self._polygons_at_z(mesh, above_z)
-            above_geom = GeometryCollection(polygons_above)
+        def get_geom(target_z):
+            cache_key = (id(mesh), target_z)
+            if hasattr(self, '_above_geom_cache') and cache_key in self._above_geom_cache:
+                return self._above_geom_cache[cache_key]
             
-            # Defer lenient geometry until it's needed
-            above_geom_lenient = None
-            above_bounds = None
-            lenient_bounds = None
-            
-            # Cache the base geometry (lenient will be added to cache if computed later)
+            polygons = self._polygons_at_z(mesh, target_z)
+            geom = GeometryCollection(polygons)
+            res = (geom, None, None, None)
             if hasattr(self, '_above_geom_cache'):
-                self._above_geom_cache[cache_key] = (above_geom, above_geom_lenient, above_bounds, lenient_bounds)
+                self._above_geom_cache[cache_key] = res
+            return res
+            
+        def update_geom(target_z, geom, geom_lenient, bounds, lenient_bounds):
+            cache_key = (id(mesh), target_z)
+            if hasattr(self, '_above_geom_cache'):
+                self._above_geom_cache[cache_key] = (geom, geom_lenient, bounds, lenient_bounds)
+
+        above_geom, above_geom_lenient, above_bounds, above_lenient_bounds = get_geom(above_z)
+        below_geom, below_geom_lenient, below_bounds, below_lenient_bounds = get_geom(below_z)
 
         # 3. Concentric insetting loop
         flat_starts = []
         current_inset = polygon.buffer(-self.horizontal_detection_distance)
         
         while current_inset and not current_inset.is_empty:
+            is_within_above = False
+            is_within_below = False
+            
             if above_geom is not None and not above_geom.is_empty:
-                is_within = current_inset.within(above_geom)
-                if is_within:
-                    break
+                is_within_above = current_inset.within(above_geom)
+            if below_geom is not None and not below_geom.is_empty:
+                is_within_below = current_inset.within(below_geom)
+                
+            if is_within_above and is_within_below:
+                break
 
-                # Lazy evaluate lenient geometry
-                if above_geom_lenient is None:
-                    bias_distance = self.flat_surface_bias
-                    above_geom_lenient = above_geom.buffer(-bias_distance) if bias_distance > 0 else above_geom
-                    if not above_geom_lenient.is_empty:
-                        shapely.prepare(above_geom_lenient)
-                    # And prepare the strict geometry since we will need it for point checks
-                    shapely.prepare(above_geom)
-                    
-                    above_bounds = above_geom.bounds
-                    lenient_bounds = above_geom_lenient.bounds if not above_geom_lenient.is_empty else None
-                    if hasattr(self, '_above_geom_cache'):
-                        self._above_geom_cache[cache_key] = (above_geom, above_geom_lenient, above_bounds, lenient_bounds)
+            # Lazy evaluate lenient geometry for above
+            if above_geom is not None and not above_geom.is_empty and above_geom_lenient is None:
+                bias_distance = self.flat_surface_bias
+                above_geom_lenient = above_geom.buffer(-bias_distance) if bias_distance > 0 else above_geom
+                if not above_geom_lenient.is_empty:
+                    shapely.prepare(above_geom_lenient)
+                shapely.prepare(above_geom)
+                above_bounds = above_geom.bounds
+                above_lenient_bounds = above_geom_lenient.bounds if not above_geom_lenient.is_empty else None
+                update_geom(above_z, above_geom, above_geom_lenient, above_bounds, above_lenient_bounds)
+
+            # Lazy evaluate lenient geometry for below
+            if below_geom is not None and not below_geom.is_empty and below_geom_lenient is None:
+                bias_distance = self.flat_surface_bias
+                below_geom_lenient = below_geom.buffer(-bias_distance) if bias_distance > 0 else below_geom
+                if not below_geom_lenient.is_empty:
+                    shapely.prepare(below_geom_lenient)
+                shapely.prepare(below_geom)
+                below_bounds = below_geom.bounds
+                below_lenient_bounds = below_geom_lenient.bounds if not below_geom_lenient.is_empty else None
+                update_geom(below_z, below_geom, below_geom_lenient, below_bounds, below_lenient_bounds)
 
             inset_starts, had_outside_points = self._slice_flat_surface_inset(
-                z, current_inset, local_boxes, above_geom, above_geom_lenient, above_bounds, lenient_bounds
+                z, current_inset, local_boxes, 
+                above_geom, above_geom_lenient, above_bounds, above_lenient_bounds,
+                below_geom, below_geom_lenient, below_bounds, below_lenient_bounds
             )
             flat_starts.extend(inset_starts)
             
@@ -644,18 +667,28 @@ class Slicer:
         end_point: Point, 
         local_boxes: dict,
         above_geom,
-        above_bounds
+        above_bounds,
+        below_geom,
+        below_bounds
     ) -> Point | None:
         if not positions[:-1]:
             return end_point
             
         # Batch check containment of all positions to grow backwards
+        xs = [pos[0] for pos in positions[:-1]]
+        ys = [pos[1] for pos in positions[:-1]]
+        
         if above_geom is not None and not above_geom.is_empty:
-            xs = [pos[0] for pos in positions[:-1]]
-            ys = [pos[1] for pos in positions[:-1]]
-            blocked_array = shapely.contains_xy(above_geom, xs, ys)
+            blocked_above = shapely.contains_xy(above_geom, xs, ys)
         else:
-            blocked_array = [False] * len(positions[:-1])
+            blocked_above = np.zeros(len(positions[:-1]), dtype=bool)
+            
+        if below_geom is not None and not below_geom.is_empty:
+            blocked_below = shapely.contains_xy(below_geom, xs, ys)
+        else:
+            blocked_below = np.zeros(len(positions[:-1]), dtype=bool)
+            
+        blocked_array = blocked_above & blocked_below
 
         n = len(positions[:-1])
         for idx, pos in enumerate(reversed(positions[:-1])):
@@ -685,14 +718,20 @@ class Slicer:
         above_geom, 
         above_geom_lenient,
         above_bounds,
-        lenient_bounds
+        above_lenient_bounds,
+        below_geom,
+        below_geom_lenient,
+        below_bounds,
+        below_lenient_bounds
     ) -> tuple[List[Point], bool]:
         if isinstance(polygon, MultiPolygon):
             starts = []
             had_outside = False
             for sub_poly in polygon.geoms:
                 sub_starts, sub_outside = self._slice_flat_surface_inset(
-                    z, sub_poly, local_boxes, above_geom, above_geom_lenient, above_bounds, lenient_bounds
+                    z, sub_poly, local_boxes, 
+                    above_geom, above_geom_lenient, above_bounds, above_lenient_bounds,
+                    below_geom, below_geom_lenient, below_bounds, below_lenient_bounds
                 )
                 starts.extend(sub_starts)
                 if sub_outside:
@@ -704,7 +743,9 @@ class Slicer:
             had_outside = False
             for geom in polygon.geoms:
                 sub_starts, sub_outside = self._slice_flat_surface_inset(
-                    z, geom, local_boxes, above_geom, above_geom_lenient, above_bounds, lenient_bounds
+                    z, geom, local_boxes, 
+                    above_geom, above_geom_lenient, above_bounds, above_lenient_bounds,
+                    below_geom, below_geom_lenient, below_bounds, below_lenient_bounds
                 )
                 starts.extend(sub_starts)
                 if sub_outside:
@@ -742,14 +783,27 @@ class Slicer:
             blocked_above = np.zeros(len(sampled_coords), dtype=bool)
             
         if above_geom_lenient is not None and not above_geom_lenient.is_empty:
-            blocked_lenient = shapely.contains_xy(above_geom_lenient, xs, ys)
+            blocked_above_lenient = shapely.contains_xy(above_geom_lenient, xs, ys)
         else:
-            blocked_lenient = np.zeros(len(sampled_coords), dtype=bool)
+            blocked_above_lenient = np.zeros(len(sampled_coords), dtype=bool)
+
+        if below_geom is not None and not below_geom.is_empty:
+            blocked_below = shapely.contains_xy(below_geom, xs, ys)
+        else:
+            blocked_below = np.zeros(len(sampled_coords), dtype=bool)
+            
+        if below_geom_lenient is not None and not below_geom_lenient.is_empty:
+            blocked_below_lenient = shapely.contains_xy(below_geom_lenient, xs, ys)
+        else:
+            blocked_below_lenient = np.zeros(len(sampled_coords), dtype=bool)
+
+        blocked_combined = blocked_above & blocked_below
+        blocked_lenient_combined = blocked_above_lenient & blocked_below_lenient
 
         # 3. Process points sequentially using precomputed arrays
         polygon_start_points = []
         
-        if blocked_above[0]:
+        if blocked_combined[0]:
             prev_point = None
         else:
             prev_point = self._check_pos(sampled_coords[0], None, local_boxes, multiple=1.0)
@@ -767,9 +821,9 @@ class Slicer:
                 past_coords.append(pos)
                 
                 if prev_point is not None:
-                    blocked = blocked_lenient[global_idx]
+                    blocked = blocked_lenient_combined[global_idx]
                 else:
-                    blocked = blocked_above[global_idx]
+                    blocked = blocked_combined[global_idx]
                 
                 if blocked:
                     prev_point = None
@@ -779,7 +833,9 @@ class Slicer:
                     if point is not None:
                         if prev_point is None:
                             start_point = self._grow_line_backwards_flat(
-                                past_coords, point, local_boxes, above_geom, above_bounds
+                                past_coords, point, local_boxes, 
+                                above_geom, above_bounds,
+                                below_geom, below_bounds
                             )
                             if start_point is not None:
                                 polygon_start_points.append(start_point)
@@ -803,13 +859,23 @@ class Slicer:
                 curr = curr.next
                 
         if surviving_coords:
-            if above_geom is None or above_geom.is_empty:
+            if (above_geom is None or above_geom.is_empty) and (below_geom is None or below_geom.is_empty):
                 had_outside_points = True
             else:
                 s_xs = [c[0] for c in surviving_coords]
                 s_ys = [c[1] for c in surviving_coords]
-                contained = shapely.contains_xy(above_geom, s_xs, s_ys)
-                had_outside_points = not np.all(contained)
+                if above_geom is not None and not above_geom.is_empty:
+                    contained_above = shapely.contains_xy(above_geom, s_xs, s_ys)
+                else:
+                    contained_above = np.zeros(len(surviving_coords), dtype=bool)
+                    
+                if below_geom is not None and not below_geom.is_empty:
+                    contained_below = shapely.contains_xy(below_geom, s_xs, s_ys)
+                else:
+                    contained_below = np.zeros(len(surviving_coords), dtype=bool)
+                    
+                contained_both = contained_above & contained_below
+                had_outside_points = not np.all(contained_both)
         else:
             had_outside_points = False
                 

@@ -8,8 +8,25 @@ def stl_to_sdf(mesh: trimesh.Trimesh, pitch: float, pad_voxels: int = 10) -> tup
     """
     Build a signed distance field using inside/outside distance transforms with padding.
     """
+    # Calculate a safe max_iter for mesh subdivision so fine pitch or large meshes don't hit trimesh's default cap of 10
+    try:
+        edges = mesh.vertices[mesh.edges[:, 0]] - mesh.vertices[mesh.edges[:, 1]]
+        longest_edge = float(np.linalg.norm(edges, axis=1).max())
+        max_edge = pitch / 2.0
+        # Add safety headroom to prevent premature ValueError: max_iter exceeded!
+        max_iter = max(int(np.ceil(np.log2(longest_edge / max_edge))) + 5, 20)
+    except Exception:
+        max_iter = 30
+
     # voxel grid (occupied surface + interior)
-    vg = mesh.voxelized(pitch).fill()
+    try:
+        vg = mesh.voxelized(pitch, max_iter=max_iter).fill()
+    except ValueError:
+        try:
+            vg = mesh.voxelized(pitch, max_iter=max_iter + 10).fill()
+        except Exception:
+            vg = mesh.voxelized(pitch, method='ray').fill()
+
     solid = vg.matrix.astype(bool)
 
     # Pad the solid array with False (empty space) on all axes
@@ -63,6 +80,13 @@ def generate_inset_mesh(
     """
     Generates an inner wall mesh using SDF.
     Allows independent horizontal and vertical offsets.
+
+    :param mesh: Input triangle mesh (coordinates in mm).
+    :param horizontal_offset: Horizontal inset distance in mm.
+    :param vertical_offset: Vertical offset distance in mm.
+    :param pitch: Voxel grid resolution / cell size in millimeters (mm).
+                 Controls the discretization fineness of the Signed Distance Field.
+                 Smaller values yield higher detail at the cost of compute time and RAM.
     """
     if horizontal_offset <= 0 and vertical_offset <= 0:
         return mesh.copy()

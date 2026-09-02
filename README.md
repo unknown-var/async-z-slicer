@@ -127,7 +127,8 @@ Example profile:
   "number_of_walls": 2,
   "solid_bottom_layer": true,
   "infill": true,
-  "infill_spacing": 2.5
+  "infill_spacing": 2.5,
+  "sdf_pitch": 0.1
 }
 ```
 
@@ -144,6 +145,12 @@ You can override printer properties (e.g. `layer_height`, `number_of_walls`) as 
 - `vertical_offset_multiple` (float): Slicing Z-offset scaling multiplier for inner walls. Default is `1.15`.
 - `min_line_segments` (int): Minimum number of segments in a path before it gets discarded to prevent blobs. Default is `20`.
 - `long_line_sample_bias` (float): Distance sample bias for straight lines. Default is `0.9`.
+- `sdf_pitch` (or `pitch`) (float): Voxel grid resolution / cell size used by `generate_inset_mesh` when computing Signed Distance Fields (SDF) for inner walls and infill boundaries. Default is `0.1` mm.
+  - **Unit:** Millimeters (**mm**). A value of `0.1` creates a 3D voxel grid where each cell is a `0.1 mm × 0.1 mm × 0.1 mm` cube.
+  - **What it does:** To generate inset meshes (shrinking the model for inner perimeter passes and infill boundaries), the slicer converts the 3D mesh into a volumetric voxel grid, runs Euclidean distance transforms (SDF) to shift the boundary inward, and reconstructs the new offset mesh via marching cubes. The pitch parameter defines the spatial sampling interval for this entire process.
+  - **Trade-offs:**
+    - **Smaller pitch (e.g., 0.05 – 0.1 mm):** High geometric precision and smoother, more detailed inset walls. However, memory consumption and computation time scale cubically ($O(1/\text{pitch}^3)$).
+    - **Larger pitch (e.g., 0.2 – 0.4 mm):** Significantly faster SDF processing and lower memory usage, but results in coarser inset geometry that may smooth out sharp corners or miss fine details.
 
 ### GCode Template Variables
 

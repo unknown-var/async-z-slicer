@@ -2,5 +2,6 @@
   "layer_height": 0.28,
   "nozzle_temp": 210,
   "number_of_walls": 2,
-  "long_line_sample_bias": 0.7
+  "long_line_sample_bias": 0.7,
+  "sdf_pitch": 0.07
 }

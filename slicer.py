@@ -35,6 +35,7 @@ def _normalize_profile_settings(profile_settings: dict) -> dict:
         'print_speed': 'default_print_speed',
         'nozzle_temp': 'default_nozzle_temp',
         'bed_temp': 'default_bed_temp',
+        'pitch': 'sdf_pitch',
     }
 
     normalized = {}
